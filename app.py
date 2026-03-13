@@ -159,9 +159,7 @@ def build_summary_text():
         summary[b["bankCode"]] = {
             "name": b["bankName"],
             "in": 0.0,
-            "out": 0.0,
-            "inCount": 0,
-            "outCount": 0
+            "out": 0.0
         }
 
     total_in = 0.0
@@ -183,26 +181,30 @@ def build_summary_text():
 
         if tx_type == "IN":
             summary[bank_code]["in"] += amount
-            summary[bank_code]["inCount"] += 1
             total_in += amount
         elif tx_type == "OUT":
             summary[bank_code]["out"] += amount
-            summary[bank_code]["outCount"] += 1
             total_out += amount
 
-    lines = ["📊 DAILY SUMMARY", "", f"Date: {today}", ""]
+    def fmt(n):
+        if n == int(n):
+            return f"{int(n):,}"
+        return f"{n:,.2f}"
+
+    lines = ["📊 DAILY SUMMARY", f"Date: {today}", ""]
 
     for bank_code, item in summary.items():
-        remainder = item["in"] - item["out"]
-        lines.append(
-            f"{item['name']} | In({item['inCount']}#): {item['in']} | "
-            f"Out({item['outCount']}#): {item['out']} | Remainder: {remainder}"
-        )
+        if item["in"] == 0 and item["out"] == 0:
+            continue
 
-    lines.append("")
-    lines.append(f"Total In : {total_in}")
-    lines.append(f"Total Out : {total_out}")
-    lines.append(f"Remainder : {total_in - total_out}")
+        lines.append(f"{item['name']}")
+        lines.append(f"IN: {fmt(item['in'])}")
+        lines.append(f"OUT: {fmt(item['out'])}")
+        lines.append("")
+
+    lines.append(f"TOTAL IN: {fmt(total_in)}")
+    lines.append(f"TOTAL OUT: {fmt(total_out)}")
+    lines.append(f"BALANCE: {fmt(total_in - total_out)}")
 
     return "\n".join(lines)
 
