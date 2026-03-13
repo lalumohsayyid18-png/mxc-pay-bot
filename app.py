@@ -187,16 +187,11 @@ def build_summary_text():
             total_out += amount
 
     def fmt(n):
-        if n == int(n):
-            return f"{int(n):,}"
         return f"{n:,.2f}"
 
     lines = ["📊 DAILY SUMMARY", f"📅 Date: {today}", ""]
 
     for bank_code, item in summary.items():
-        if item["in"] == 0 and item["out"] == 0:
-            continue
-
         balance = item["in"] - item["out"]
 
         lines.append(f"🏦 {item['name']}")
