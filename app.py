@@ -191,20 +191,23 @@ def build_summary_text():
             return f"{int(n):,}"
         return f"{n:,.2f}"
 
-    lines = ["📊 DAILY SUMMARY", f"Date: {today}", ""]
+    lines = ["📊 DAILY SUMMARY", f"📅 Date: {today}", ""]
 
     for bank_code, item in summary.items():
         if item["in"] == 0 and item["out"] == 0:
             continue
 
-        lines.append(f"{item['name']}")
-        lines.append(f"IN: {fmt(item['in'])}")
-        lines.append(f"OUT: {fmt(item['out'])}")
+        balance = item["in"] - item["out"]
+
+        lines.append(f"🏦 {item['name']}")
+        lines.append(f"📥 IN: {fmt(item['in'])}")
+        lines.append(f"📤 OUT: {fmt(item['out'])}")
+        lines.append(f"💰 BALANCE: {fmt(balance)}")
         lines.append("")
 
-    lines.append(f"TOTAL IN: {fmt(total_in)}")
-    lines.append(f"TOTAL OUT: {fmt(total_out)}")
-    lines.append(f"BALANCE: {fmt(total_in - total_out)}")
+    lines.append("━━━━━━━━━━━━━━")
+    lines.append(f"📈 TOTAL IN: {fmt(total_in)}")
+    lines.append(f"📉 TOTAL OUT: {fmt(total_out)}")
 
     return "\n".join(lines)
 
