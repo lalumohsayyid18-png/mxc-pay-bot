@@ -97,11 +97,19 @@ def get_bank_rows():
         code = str(row[0]).strip().upper() if len(row) > 0 else ""
         name = str(row[1]).strip() if len(row) > 1 else code
         active = str(row[2]).strip().upper() if len(row) > 2 else ""
+        opening_balance = 0.0
+
+        if len(row) > 3 and str(row[3]).strip():
+            try:
+                opening_balance = float(str(row[3]).replace(",", ""))
+            except Exception:
+                opening_balance = 0.0
 
         if code and active == "YES":
             out.append({
                 "bankCode": code,
-                "bankName": name or code
+                "bankName": name or code,
+                "openingBalance": opening_balance
             })
 
     return out
@@ -158,12 +166,14 @@ def build_summary_text():
     for b in banks:
         summary[b["bankCode"]] = {
             "name": b["bankName"],
-            "in": 0.0,
-            "out": 0.0
+            "today_in": 0.0,
+            "today_out": 0.0,
+            "opening_balance": float(b.get("openingBalance", 0.0)),
+            "total_balance": float(b.get("openingBalance", 0.0))
         }
 
-    total_in = 0.0
-    total_out = 0.0
+    total_today_in = 0.0
+    total_today_out = 0.0
 
     for row in rows[1:]:
         row_date = str(row[0]).strip() if len(row) > 0 else ""
@@ -172,19 +182,25 @@ def build_summary_text():
         bank_code = str(row[6]).strip().upper() if len(row) > 6 else ""
         status = str(row[7]).strip() if len(row) > 7 else ""
 
-        if row_date != today:
-            continue
         if status != "Success":
             continue
         if bank_code not in summary:
             continue
 
+        # total balance = opening balance + all historical in/out
         if tx_type == "IN":
-            summary[bank_code]["in"] += amount
-            total_in += amount
+            summary[bank_code]["total_balance"] += amount
         elif tx_type == "OUT":
-            summary[bank_code]["out"] += amount
-            total_out += amount
+            summary[bank_code]["total_balance"] -= amount
+
+        # today in/out only
+        if row_date == today:
+            if tx_type == "IN":
+                summary[bank_code]["today_in"] += amount
+                total_today_in += amount
+            elif tx_type == "OUT":
+                summary[bank_code]["today_out"] += amount
+                total_today_out += amount
 
     def fmt(n):
         return f"{n:,.2f}"
@@ -192,17 +208,16 @@ def build_summary_text():
     lines = ["📊 DAILY SUMMARY", f"📅 Date: {today}", ""]
 
     for bank_code, item in summary.items():
-        balance = item["in"] - item["out"]
-
         lines.append(f"🏦 {item['name']}")
-        lines.append(f"📥 IN: {fmt(item['in'])}")
-        lines.append(f"📤 OUT: {fmt(item['out'])}")
-        lines.append(f"💰 BALANCE: {fmt(balance)}")
+        lines.append(f"💼 OPENING: {fmt(item['opening_balance'])}")
+        lines.append(f"📥 TODAY IN: {fmt(item['today_in'])}")
+        lines.append(f"📤 TODAY OUT: {fmt(item['today_out'])}")
+        lines.append(f"💰 TOTAL BALANCE: {fmt(item['total_balance'])}")
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━")
-    lines.append(f"📈 TOTAL IN: {fmt(total_in)}")
-    lines.append(f"📉 TOTAL OUT: {fmt(total_out)}")
+    lines.append(f"📈 TOTAL TODAY IN: {fmt(total_today_in)}")
+    lines.append(f"📉 TOTAL TODAY OUT: {fmt(total_today_out)}")
 
     return "\n".join(lines)
 
