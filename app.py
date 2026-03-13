@@ -10,7 +10,7 @@ from datetime import datetime
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")
 
-app = Flask(**name**)
+app = Flask(__name__)
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
