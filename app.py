@@ -97,10 +97,13 @@ def parse_amount(value):
 
     if "," in s and "." in s:
         if s.rfind(",") > s.rfind("."):
+            # contoh: 1.234,56
             s = s.replace(".", "").replace(",", ".")
         else:
+            # contoh: 1,234.56
             s = s.replace(",", "")
     elif "," in s:
+        # contoh: 646,02
         s = s.replace(",", ".")
 
     try:
@@ -207,6 +210,63 @@ def parse_tx_command(text):
     }
 
 
+def parse_cancel_command(text):
+    m = re.match(r"^(?:cancel|batal)\s+([A-Za-z0-9]+)$", text.strip(), re.IGNORECASE)
+    if not m:
+        return None
+    return m.group(1).upper()
+
+
+def cancel_transaction(tx_id):
+    tx_id = str(tx_id).strip().upper()
+    ws = get_sheet("TRANSAKSI")
+    rows = ws.get_all_values()
+
+    for idx, row in enumerate(rows[1:], start=2):
+        row_tx_id = str(row[2]).strip().upper() if len(row) > 2 else ""
+        if row_tx_id != tx_id:
+            continue
+
+        tx_date = str(row[0]).strip() if len(row) > 0 else ""
+        tx_time = str(row[1]).strip() if len(row) > 1 else ""
+        tx_type = str(row[3]).strip().upper() if len(row) > 3 else ""
+        member_name = str(row[4]).strip() if len(row) > 4 else ""
+        amount = parse_amount(row[5]) if len(row) > 5 else 0.0
+        bank_code = str(row[6]).strip().upper() if len(row) > 6 else ""
+        status = str(row[7]).strip() if len(row) > 7 else ""
+
+        if status == "Cancelled":
+            return {
+                "ok": False,
+                "reason": "already_cancelled"
+            }
+
+        if status != "Success":
+            return {
+                "ok": False,
+                "reason": f"invalid_status_{status}"
+            }
+
+        ws.update_cell(idx, 8, "Cancelled")
+
+        return {
+            "ok": True,
+            "tx_id": row_tx_id,
+            "date": tx_date,
+            "time": tx_time,
+            "type": tx_type,
+            "name": member_name,
+            "amount": amount,
+            "bank_code": bank_code,
+            "status": "Cancelled"
+        }
+
+    return {
+        "ok": False,
+        "reason": "not_found"
+    }
+
+
 def build_summary_text():
     tx_ws = get_sheet("TRANSAKSI")
     rows = tx_ws.get_all_values()
@@ -309,6 +369,38 @@ def webhook():
 
         if text.lower() == "summary":
             send_message(chat_id, build_summary_text(), thread_id)
+            return "ok", 200
+
+        cancel_tx_id = parse_cancel_command(text)
+        if cancel_tx_id:
+            result = cancel_transaction(cancel_tx_id)
+
+            if not result["ok"]:
+                if result["reason"] == "not_found":
+                    send_message(chat_id, f"TX_ID {cancel_tx_id} tidak ditemukan.", thread_id)
+                elif result["reason"] == "already_cancelled":
+                    send_message(chat_id, f"TX_ID {cancel_tx_id} sudah pernah dibatalkan.", thread_id)
+                else:
+                    send_message(chat_id, f"TX_ID {cancel_tx_id} gagal dibatalkan.", thread_id)
+                return "ok", 200
+
+            bank = get_bank_info(result["bank_code"])
+            bank_name = bank["bankName"] if bank else result["bank_code"]
+            bank_balance = get_bank_total_balance(result["bank_code"])
+
+            cancel_text = (
+                f"❌ TRANSACTION CANCELLED\n\n"
+                f"TX_ID: {result['tx_id']}\n"
+                f"Date: {result['date']} {result['time']}\n"
+                f"Type: {result['type']}\n"
+                f"Name: {result['name']}\n"
+                f"Amount: {result['amount']:,.2f}\n"
+                f"Bank: {bank_name}\n"
+                f"New Bank Balance: {bank_balance:,.2f}\n"
+                f"Status: Cancelled"
+            )
+
+            send_message(chat_id, cancel_text, thread_id)
             return "ok", 200
 
         cmd = parse_tx_command(text)
