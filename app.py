@@ -26,7 +26,7 @@ DEFAULT_TIMEZONE = "Asia/Kuala_Lumpur"
 def now_local():
     try:
         return datetime.now(ZoneInfo(DEFAULT_TIMEZONE))
-    except Exception:
+    except:
         return datetime.now()
 
 
@@ -50,19 +50,15 @@ def get_settings():
     try:
         ws = get_sheet("SETTINGS")
         rows = ws.get_all_values()
-        for row in rows[1:]:
-            key = str(row[0]).strip()
-            val = str(row[1]).strip()
-            if key:
-                data[key] = val
+        for r in rows[1:]:
+            data[r[0]] = r[1]
     except:
         pass
     return data
 
 
-def log_message(level, message, raw=""):
-
-    print(f"[{level}] {message} {raw}", flush=True)
+def log_message(level, msg, raw=""):
+    print(level, msg, raw)
 
     if level != "ERROR":
         return
@@ -72,32 +68,32 @@ def log_message(level, message, raw=""):
         ws.append_row([
             now_local().strftime("%Y-%m-%d %H:%M:%S"),
             level,
-            message,
+            msg,
             raw
         ])
     except:
         pass
 
 
-def send_message(chat_id, text, thread_id=None):
+def send_message(chat, text, topic=None):
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
     payload = {
-        "chat_id": str(chat_id),
+        "chat_id": chat,
         "text": text
     }
 
-    if thread_id:
-        payload["message_thread_id"] = int(thread_id)
+    if topic:
+        payload["message_thread_id"] = int(topic)
 
     try:
         requests.post(url, json=payload, timeout=30)
     except Exception as e:
-        log_message("ERROR", "sendMessage_failed", str(e))
+        log_message("ERROR", "sendMessage", str(e))
 
 
-def send_document(chat_id, file_bytes, filename, thread_id=None):
+def send_document(chat, file_bytes, filename, topic=None):
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
 
@@ -106,16 +102,16 @@ def send_document(chat_id, file_bytes, filename, thread_id=None):
     }
 
     data = {
-        "chat_id": str(chat_id)
+        "chat_id": chat
     }
 
-    if thread_id:
-        data["message_thread_id"] = int(thread_id)
+    if topic:
+        data["message_thread_id"] = int(topic)
 
     try:
         requests.post(url, data=data, files=files, timeout=60)
     except Exception as e:
-        log_message("ERROR", "sendDocument_failed", str(e))
+        log_message("ERROR", "sendDocument", str(e))
 
 
 def extract_message_text(msg):
@@ -126,12 +122,10 @@ def extract_message_text(msg):
     return (msg.get("text") or msg.get("caption") or "").strip()
 
 
-def parse_amount(value):
-
-    s = str(value).replace(",", "").strip()
+def parse_amount(v):
 
     try:
-        return float(s)
+        return float(str(v).replace(",", ""))
     except:
         return 0
 
@@ -141,28 +135,28 @@ def get_bank_rows():
     ws = get_sheet("BANK_LIST")
     rows = ws.get_all_values()
 
-    out = []
+    banks = []
 
-    for row in rows[1:]:
+    for r in rows[1:]:
 
-        code = str(row[0]).strip().upper()
-        name = str(row[1]).strip()
-        active = str(row[2]).strip().upper()
+        code = r[0].strip().upper()
+        name = r[1].strip()
+        active = r[2].strip().upper()
 
         opening = 0
 
-        if len(row) > 3:
-            opening = parse_amount(row[3])
+        if len(r) > 3:
+            opening = parse_amount(r[3])
 
-        if code and active == "YES":
+        if active == "YES":
 
-            out.append({
+            banks.append({
                 "bankCode": code,
                 "bankName": name,
                 "openingBalance": opening
             })
 
-    return out
+    return banks
 
 
 def get_bank_info(code):
@@ -177,33 +171,32 @@ def get_bank_info(code):
 def generate_tx_id(tx_type):
 
     ws = get_sheet("TRANSAKSI")
-
     rows = ws.get_all_values()
 
-    prefix = f"{tx_type}{now_local().strftime('%Y%m%d')}"
+    prefix = tx_type + now_local().strftime("%Y%m%d")
 
     num = 0
 
     for r in rows[1:]:
 
-        tx = str(r[2]).strip()
+        tx = r[2]
 
         if tx.startswith(prefix):
 
-            n = tx.replace(prefix, "")
+            tail = tx.replace(prefix, "")
 
-            if n.isdigit():
-                num = max(num, int(n))
+            if tail.isdigit():
+                num = max(num, int(tail))
 
-    return f"{prefix}{str(num+1).zfill(4)}"
+    return prefix + str(num+1).zfill(4)
 
 
-def get_bank_total_balance(bank_code):
+def get_bank_total_balance(bank):
 
     opening = 0
 
     for b in get_bank_rows():
-        if b["bankCode"] == bank_code:
+        if b["bankCode"] == bank:
             opening = b["openingBalance"]
 
     ws = get_sheet("TRANSAKSI")
@@ -213,14 +206,10 @@ def get_bank_total_balance(bank_code):
 
     for r in rows[1:]:
 
-        status = str(r[7]).strip()
-
-        if status != "Success":
+        if r[7] != "Success":
             continue
 
-        code = str(r[6]).strip()
-
-        if code != bank_code:
+        if r[6] != bank:
             continue
 
         amt = parse_amount(r[5])
@@ -245,6 +234,35 @@ def parse_tx_command(text):
         "amount": float(m.group(2)),
         "bankCode": m.group(3).upper()
     }
+
+
+def parse_cancel_command(text):
+
+    m = re.match(r"^cancel\s+([A-Za-z0-9]+)$", text, re.IGNORECASE)
+
+    if not m:
+        return None
+
+    return m.group(1)
+
+
+def cancel_transaction(tx_id):
+
+    ws = get_sheet("TRANSAKSI")
+    rows = ws.get_all_values()
+
+    for i, r in enumerate(rows[1:], start=2):
+
+        if r[2] == tx_id:
+
+            if r[7] == "Cancelled":
+                return "already"
+
+            ws.update_cell(i, 8, "Cancelled")
+
+            return "ok"
+
+    return "notfound"
 
 
 def build_summary_text():
@@ -356,11 +374,11 @@ def run_daily_closing():
     chat = settings.get("ALLOWED_CHAT_ID")
     topic = settings.get("REPORT_TOPIC_ID")
 
-    send_message(chat, "📊 DAILY CLOSING\n\n"+build_summary_text(), topic)
+    send_message(chat, "📊 DAILY CLOSING\n\n" + build_summary_text(), topic)
 
     csv_file = build_closing_csv()
 
-    filename = f"closing_{now_local().strftime('%Y-%m-%d')}.csv"
+    filename = "closing_" + now_local().strftime("%Y-%m-%d") + ".csv"
 
     send_document(chat, csv_file, filename, topic)
 
@@ -380,7 +398,7 @@ def closing_scheduler():
                 time.sleep(60)
 
         except Exception as e:
-            log_message("ERROR","closing_scheduler",str(e))
+            log_message("ERROR", "closing", str(e))
 
         time.sleep(20)
 
@@ -402,16 +420,28 @@ def webhook():
         if not message:
             return "ok"
 
-        settings = get_settings()
-
         chat_id = str(message["chat"]["id"])
         text = extract_message_text(message)
-
-        thread_id = message.get("message_thread_id")
+        topic = message.get("message_thread_id")
 
         if text.lower() == "summary":
 
-            send_message(chat_id, build_summary_text(), thread_id)
+            send_message(chat_id, build_summary_text(), topic)
+
+            return "ok"
+
+        cancel_id = parse_cancel_command(text)
+
+        if cancel_id:
+
+            result = cancel_transaction(cancel_id)
+
+            if result == "ok":
+                send_message(chat_id, "❌ TX Cancelled\n" + cancel_id, topic)
+            elif result == "already":
+                send_message(chat_id, "TX already cancelled", topic)
+            else:
+                send_message(chat_id, "TX not found", topic)
 
             return "ok"
 
@@ -423,7 +453,7 @@ def webhook():
         reply_msg = message.get("reply_to_message")
 
         if not reply_msg:
-            send_message(chat_id,"Reply ke nama member",thread_id)
+            send_message(chat_id, "Reply ke pesan member", topic)
             return "ok"
 
         name = extract_message_text(reply_msg).split("\n")[0]
@@ -431,7 +461,7 @@ def webhook():
         bank = get_bank_info(cmd["bankCode"])
 
         if not bank:
-            send_message(chat_id,"Bank tidak valid",thread_id)
+            send_message(chat_id, "Bank tidak valid", topic)
             return "ok"
 
         tx_id = generate_tx_id(cmd["type"])
@@ -451,20 +481,20 @@ def webhook():
 
         balance = get_bank_total_balance(cmd["bankCode"])
 
-        send_message(chat_id,f"""✅ {cmd['type']} SUCCESS
+        send_message(chat_id, f"""✅ {cmd['type']} SUCCESS
 
 TX_ID: {tx_id}
 Name: {name}
 Amount: {cmd['amount']}
 Bank: {bank['bankName']}
 Bank Balance: {balance:,.2f}
-""",thread_id)
+""", topic)
 
         return "ok"
 
     except Exception as e:
 
-        log_message("ERROR","webhook_error",str(e))
+        log_message("ERROR", "webhook", str(e))
 
         return "ok"
 
