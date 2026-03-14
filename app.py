@@ -147,14 +147,12 @@ def generate_tx_id(tx_type):
 def get_bank_total_balance(bank_code):
     bank_code = str(bank_code).strip().upper()
 
-    # ambil opening balance dari BANK_LIST
     opening_balance = 0.0
     for bank in get_bank_rows():
         if bank["bankCode"] == bank_code:
             opening_balance = float(bank.get("openingBalance", 0.0))
             break
 
-    # hitung semua histori transaksi bank ini
     tx_ws = get_sheet("TRANSAKSI")
     rows = tx_ws.get_all_values()
 
@@ -177,6 +175,7 @@ def get_bank_total_balance(bank_code):
             balance -= amount
 
     return balance
+
 
 def parse_tx_command(text):
     m = re.match(r"^([+-])\s*(\d+(?:\.\d+)?)\s+([A-Za-z0-9_]+)$", text.strip())
@@ -221,13 +220,11 @@ def build_summary_text():
         if bank_code not in summary:
             continue
 
-        # total balance = opening balance + all historical in/out
         if tx_type == "IN":
             summary[bank_code]["total_balance"] += amount
         elif tx_type == "OUT":
             summary[bank_code]["total_balance"] -= amount
 
-        # today in/out only
         if row_date == today:
             if tx_type == "IN":
                 summary[bank_code]["today_in"] += amount
@@ -339,15 +336,15 @@ def webhook():
 
         bank_balance = get_bank_total_balance(cmd["bankCode"])
 
-success_text = (
-    f"✅ {cmd['type']} SUCCESS\n\n"
-    f"TX_ID: {tx_id}\n"
-    f"Name: {full_name}\n"
-    f"Amount: {cmd['amount']}\n"
-    f"Bank: {bank['bankName']}\n"
-    f"Bank Balance: {bank_balance:,.2f}\n"
-    f"Status: Success"
-)
+        success_text = (
+            f"✅ {cmd['type']} SUCCESS\n\n"
+            f"TX_ID: {tx_id}\n"
+            f"Name: {full_name}\n"
+            f"Amount: {cmd['amount']}\n"
+            f"Bank: {bank['bankName']}\n"
+            f"Bank Balance: {bank_balance:,.2f}\n"
+            f"Status: Success"
+        )
 
         send_message(chat_id, success_text, thread_id)
         return "ok", 200
