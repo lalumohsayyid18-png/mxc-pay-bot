@@ -471,8 +471,15 @@ Bank Balance: {balance:,.2f}
 
 if __name__ == "__main__":
 
-    threading.Thread(target=closing_scheduler,daemon=True).start()
+    scheduler = threading.Thread(target=closing_scheduler)
+    scheduler.daemon = True
+    scheduler.start()
 
-    port = int(os.environ.get("PORT",10000))
+    port = int(os.environ.get("PORT", 10000))
 
-    app.run(host="0.0.0.0",port=port)
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+        use_reloader=False
+    )
