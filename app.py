@@ -97,13 +97,10 @@ def parse_amount(value):
 
     if "," in s and "." in s:
         if s.rfind(",") > s.rfind("."):
-            # contoh: 1.234,56
             s = s.replace(".", "").replace(",", ".")
         else:
-            # contoh: 1,234.56
             s = s.replace(",", "")
     elif "," in s:
-        # contoh: 646,02
         s = s.replace(",", ".")
 
     try:
@@ -259,7 +256,7 @@ def build_summary_text():
 
     lines = ["📊 DAILY SUMMARY", f"📅 Date: {today}", ""]
 
-    for bank_code, item in summary.items():
+    for _, item in summary.items():
         lines.append(f"🏦 {item['name']}")
         lines.append(f"💼 OPENING: {fmt(item['opening_balance'])}")
         lines.append(f"📥 TODAY IN: {fmt(item['today_in'])}")
@@ -373,3 +370,8 @@ def webhook():
     except Exception as e:
         log_message("ERROR", "webhook_error", str(e))
         return "ok", 200
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
