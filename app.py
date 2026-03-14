@@ -88,6 +88,30 @@ def extract_message_text(msg):
     return (msg.get("text") or msg.get("caption") or "").strip()
 
 
+def parse_amount(value):
+    s = str(value).strip()
+    if not s:
+        return 0.0
+
+    s = s.replace(" ", "")
+
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            # contoh: 1.234,56
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            # contoh: 1,234.56
+            s = s.replace(",", "")
+    elif "," in s:
+        # contoh: 646,02
+        s = s.replace(",", ".")
+
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+
 def get_bank_rows():
     ws = get_sheet("BANK_LIST")
     rows = ws.get_all_values()
@@ -100,10 +124,7 @@ def get_bank_rows():
         opening_balance = 0.0
 
         if len(row) > 3 and str(row[3]).strip():
-            try:
-                opening_balance = float(str(row[3]).replace(",", ""))
-            except Exception:
-                opening_balance = 0.0
+            opening_balance = parse_amount(row[3])
 
         if code and active == "YES":
             out.append({
@@ -160,7 +181,7 @@ def get_bank_total_balance(bank_code):
 
     for row in rows[1:]:
         tx_type = str(row[3]).strip().upper() if len(row) > 3 else ""
-        amount = float(row[5]) if len(row) > 5 and str(row[5]).strip() else 0.0
+        amount = parse_amount(row[5]) if len(row) > 5 else 0.0
         row_bank_code = str(row[6]).strip().upper() if len(row) > 6 else ""
         status = str(row[7]).strip() if len(row) > 7 else ""
 
@@ -178,13 +199,13 @@ def get_bank_total_balance(bank_code):
 
 
 def parse_tx_command(text):
-    m = re.match(r"^([+-])\s*(\d+(?:\.\d+)?)\s+([A-Za-z0-9_]+)$", text.strip())
+    m = re.match(r"^([+-])\s*(\d+(?:[.,]\d+)?)\s+([A-Za-z0-9_]+)$", text.strip())
     if not m:
         return None
 
     return {
         "type": "IN" if m.group(1) == "+" else "OUT",
-        "amount": float(m.group(2)),
+        "amount": parse_amount(m.group(2)),
         "bankCode": m.group(3).upper()
     }
 
@@ -211,7 +232,7 @@ def build_summary_text():
     for row in rows[1:]:
         row_date = str(row[0]).strip() if len(row) > 0 else ""
         tx_type = str(row[3]).strip().upper() if len(row) > 3 else ""
-        amount = float(row[5]) if len(row) > 5 and str(row[5]).strip() else 0.0
+        amount = parse_amount(row[5]) if len(row) > 5 else 0.0
         bank_code = str(row[6]).strip().upper() if len(row) > 6 else ""
         status = str(row[7]).strip() if len(row) > 7 else ""
 
@@ -340,7 +361,7 @@ def webhook():
             f"✅ {cmd['type']} SUCCESS\n\n"
             f"TX_ID: {tx_id}\n"
             f"Name: {full_name}\n"
-            f"Amount: {cmd['amount']}\n"
+            f"Amount: {cmd['amount']:,.2f}\n"
             f"Bank: {bank['bankName']}\n"
             f"Bank Balance: {bank_balance:,.2f}\n"
             f"Status: Success"
