@@ -57,7 +57,13 @@ def get_settings():
 
 
 def log_message(level, message, raw=""):
+    # selalu tampil di console Render
     print(f"[{level}] {message} {raw}", flush=True)
+
+    # hanya simpan ERROR ke Google Sheet
+    if level != "ERROR":
+        return
+
     try:
         ws = get_sheet("LOG")
         t = now_local().strftime("%Y-%m-%d %H:%M:%S")
