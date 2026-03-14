@@ -57,10 +57,9 @@ def get_settings():
 
 
 def log_message(level, message, raw=""):
-    # selalu tampil di console Render
     print(f"[{level}] {message} {raw}", flush=True)
 
-    # hanya simpan ERROR ke Google Sheet
+    # hanya ERROR yang disimpan ke Google Sheet
     if level != "ERROR":
         return
 
@@ -75,15 +74,16 @@ def log_message(level, message, raw=""):
 def send_message(chat_id, text, thread_id=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": chat_id,
+        "chat_id": str(chat_id),
         "text": text
     }
-    if thread_id:
+
+    if thread_id not in (None, "", "0"):
         payload["message_thread_id"] = int(thread_id)
 
     try:
         res = requests.post(url, json=payload, timeout=30)
-        log_message("INFO", "sendMessage", res.text)
+        print(f"[TG] sendMessage {res.text}", flush=True)
     except Exception as e:
         log_message("ERROR", "sendMessage_failed", str(e))
 
@@ -242,16 +242,10 @@ def cancel_transaction(tx_id):
         status = str(row[7]).strip() if len(row) > 7 else ""
 
         if status == "Cancelled":
-            return {
-                "ok": False,
-                "reason": "already_cancelled"
-            }
+            return {"ok": False, "reason": "already_cancelled"}
 
         if status != "Success":
-            return {
-                "ok": False,
-                "reason": f"invalid_status_{status}"
-            }
+            return {"ok": False, "reason": f"invalid_status_{status}"}
 
         ws.update_cell(idx, 8, "Cancelled")
 
@@ -267,10 +261,7 @@ def cancel_transaction(tx_id):
             "status": "Cancelled"
         }
 
-    return {
-        "ok": False,
-        "reason": "not_found"
-    }
+    return {"ok": False, "reason": "not_found"}
 
 
 def build_summary_text():
@@ -286,11 +277,15 @@ def build_summary_text():
             "today_in": 0.0,
             "today_out": 0.0,
             "opening_balance": float(b.get("openingBalance", 0.0)),
-            "total_balance": float(b.get("openingBalance", 0.0))
+            "total_balance": float(b.get("openingBalance", 0.0)),
+            "today_in_count": 0,
+            "today_out_count": 0
         }
 
     total_today_in = 0.0
     total_today_out = 0.0
+    total_today_in_count = 0
+    total_today_out_count = 0
 
     for row in rows[1:]:
         row_date = str(row[0]).strip() if len(row) > 0 else ""
@@ -312,10 +307,14 @@ def build_summary_text():
         if row_date == today:
             if tx_type == "IN":
                 summary[bank_code]["today_in"] += amount
+                summary[bank_code]["today_in_count"] += 1
                 total_today_in += amount
+                total_today_in_count += 1
             elif tx_type == "OUT":
                 summary[bank_code]["today_out"] += amount
+                summary[bank_code]["today_out_count"] += 1
                 total_today_out += amount
+                total_today_out_count += 1
 
     def fmt(n):
         return f"{n:,.2f}"
@@ -324,17 +323,32 @@ def build_summary_text():
 
     for _, item in summary.items():
         lines.append(f"🏦 {item['name']}")
-        lines.append(f"💼 OPENING: {fmt(item['opening_balance'])}")
-        lines.append(f"📥 TODAY IN: {fmt(item['today_in'])}")
-        lines.append(f"📤 TODAY OUT: {fmt(item['today_out'])}")
+        lines.append(f"📥 IN ({item['today_in_count']}#): {fmt(item['today_in'])}")
+        lines.append(f"📤 OUT ({item['today_out_count']}#): {fmt(item['today_out'])}")
         lines.append(f"💰 TOTAL BALANCE: {fmt(item['total_balance'])}")
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━")
-    lines.append(f"📈 TOTAL TODAY IN: {fmt(total_today_in)}")
-    lines.append(f"📉 TOTAL TODAY OUT: {fmt(total_today_out)}")
+    lines.append(f"📈 TOTAL IN ({total_today_in_count}#): {fmt(total_today_in)}")
+    lines.append(f"📉 TOTAL OUT ({total_today_out_count}#): {fmt(total_today_out)}")
+    lines.append(f"💵 REMAINDER: {fmt(total_today_in - total_today_out)}")
 
     return "\n".join(lines)
+
+
+def send_report_summary(settings):
+    report_chat_id = str(settings.get("REPORT_CHAT_ID", "")).strip()
+    report_topic_id = str(settings.get("REPORT_TOPIC_ID", "")).strip()
+    allowed_chat_id = str(settings.get("ALLOWED_CHAT_ID", "")).strip()
+
+    target_chat_id = report_chat_id or allowed_chat_id
+    target_thread_id = report_topic_id or None
+
+    if not target_chat_id:
+        return
+
+    summary_text = build_summary_text()
+    send_message(target_chat_id, summary_text, target_thread_id)
 
 
 @app.route("/", methods=["GET"])
@@ -346,7 +360,7 @@ def home():
 def webhook():
     try:
         data = request.get_json(silent=True) or {}
-        log_message("INFO", "incoming", json.dumps(data))
+        print(f"[INFO] incoming {json.dumps(data)}", flush=True)
 
         message = data.get("message") or data.get("edited_message")
         if not message:
@@ -359,10 +373,10 @@ def webhook():
         thread_id = message.get("message_thread_id")
         text = extract_message_text(message)
 
-        log_message("INFO", "text", text)
+        print(f"[INFO] text {text}", flush=True)
 
         if allowed_chat_id and chat_id != allowed_chat_id:
-            log_message("WARN", "unauthorized_chat", chat_id)
+            print(f"[WARN] unauthorized_chat {chat_id}", flush=True)
             return "ok", 200
 
         if not text:
@@ -407,11 +421,17 @@ def webhook():
             )
 
             send_message(chat_id, cancel_text, thread_id)
+
+            try:
+                send_report_summary(settings)
+            except Exception as e:
+                log_message("ERROR", "send_report_summary_cancel_failed", str(e))
+
             return "ok", 200
 
         cmd = parse_tx_command(text)
         if not cmd:
-            log_message("INFO", "ignored_text", text)
+            print(f"[INFO] ignored_text {text}", flush=True)
             return "ok", 200
 
         reply_msg = message.get("reply_to_message")
@@ -463,6 +483,12 @@ def webhook():
         )
 
         send_message(chat_id, success_text, thread_id)
+
+        try:
+            send_report_summary(settings)
+        except Exception as e:
+            log_message("ERROR", "send_report_summary_success_failed", str(e))
+
         return "ok", 200
 
     except Exception as e:
