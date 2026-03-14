@@ -144,6 +144,40 @@ def generate_tx_id(tx_type):
     return f"{prefix}{str(max_num + 1).zfill(4)}"
 
 
+def get_bank_total_balance(bank_code):
+    bank_code = str(bank_code).strip().upper()
+
+    # ambil opening balance dari BANK_LIST
+    opening_balance = 0.0
+    for bank in get_bank_rows():
+        if bank["bankCode"] == bank_code:
+            opening_balance = float(bank.get("openingBalance", 0.0))
+            break
+
+    # hitung semua histori transaksi bank ini
+    tx_ws = get_sheet("TRANSAKSI")
+    rows = tx_ws.get_all_values()
+
+    balance = opening_balance
+
+    for row in rows[1:]:
+        tx_type = str(row[3]).strip().upper() if len(row) > 3 else ""
+        amount = float(row[5]) if len(row) > 5 and str(row[5]).strip() else 0.0
+        row_bank_code = str(row[6]).strip().upper() if len(row) > 6 else ""
+        status = str(row[7]).strip() if len(row) > 7 else ""
+
+        if status != "Success":
+            continue
+        if row_bank_code != bank_code:
+            continue
+
+        if tx_type == "IN":
+            balance += amount
+        elif tx_type == "OUT":
+            balance -= amount
+
+    return balance
+
 def parse_tx_command(text):
     m = re.match(r"^([+-])\s*(\d+(?:\.\d+)?)\s+([A-Za-z0-9_]+)$", text.strip())
     if not m:
@@ -303,14 +337,17 @@ def webhook():
             "Success"
         ])
 
-        success_text = (
-            f"✅ {cmd['type']} SUCCESS\n\n"
-            f"TX_ID: {tx_id}\n"
-            f"Name: {full_name}\n"
-            f"Amount: {cmd['amount']}\n"
-            f"Bank: {bank['bankName']}\n"
-            f"Status: Success"
-        )
+        bank_balance = get_bank_total_balance(cmd["bankCode"])
+
+success_text = (
+    f"✅ {cmd['type']} SUCCESS\n\n"
+    f"TX_ID: {tx_id}\n"
+    f"Name: {full_name}\n"
+    f"Amount: {cmd['amount']}\n"
+    f"Bank: {bank['bankName']}\n"
+    f"Bank Balance: {bank_balance:,.2f}\n"
+    f"Status: Success"
+)
 
         send_message(chat_id, success_text, thread_id)
         return "ok", 200
