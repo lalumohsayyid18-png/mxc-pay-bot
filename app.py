@@ -112,7 +112,7 @@ def telegram_api(method, payload):
 
 def send_message(chat_id, text, reply_to_message_id=None):
     if not BOT_TOKEN or not chat_id:
-        return
+        return None
     payload = {
         "chat_id": str(chat_id),
         "text": text,
@@ -120,7 +120,7 @@ def send_message(chat_id, text, reply_to_message_id=None):
     }
     if reply_to_message_id:
         payload["reply_to_message_id"] = reply_to_message_id
-    telegram_api("sendMessage", payload)
+    return telegram_api("sendMessage", payload)
 
 
 def format_amount(value):
@@ -158,13 +158,6 @@ def normalize_bank_code(text):
 
 
 def parse_reply_transaction_input(text):
-    """
-    Valid format:
-    +100 TERRI
-    -100 TERRI
-    +500.27 HWD
-    -877,47 NEXA
-    """
     text = (text or "").strip()
     if not text:
         return None
@@ -187,8 +180,7 @@ def extract_full_name_from_replied_message(message):
     reply = message.get("reply_to_message")
     if not reply:
         return ""
-    full_name = (reply.get("text") or reply.get("caption") or "").strip()
-    return full_name
+    return (reply.get("text") or reply.get("caption") or "").strip()
 
 
 def append_main_transaction(spreadsheet, tx_id, tx_type, full_name, amount, bank_code, status="Success"):
@@ -309,7 +301,7 @@ def get_opening_balances(spreadsheet):
     return balances
 
 
-def build_daily_summary(spreadsheet, target_date=None):
+def calculate_bank_balances(spreadsheet, target_date=None):
     target_date = target_date or today_str()
     rows = get_all_main_records(spreadsheet)
     opening_balances = get_opening_balances(spreadsheet)
@@ -354,38 +346,80 @@ def build_daily_summary(spreadsheet, target_date=None):
         elif status == "cancelled":
             cancelled_count += 1
 
-    lines = [f"<b>SUMMARY {target_date}</b>", ""]
-    lines.append(f"Success TX: <b>{success_count}</b>")
-    lines.append(f"Cancelled TX: <b>{cancelled_count}</b>")
-    lines.append(f"Total IN: <b>{format_amount(total_in)}</b>")
-    lines.append(f"Total OUT: <b>{format_amount(total_out)}</b>")
-    lines.append(f"Net: <b>{format_amount(total_in - total_out)}</b>")
-    lines.append("")
-
-    for bank in sorted(summary.keys()):
+    balances = {}
+    for bank in summary.keys():
         bank_in = float(summary[bank]["IN"])
         bank_out = float(summary[bank]["OUT"])
         cnt = int(summary[bank]["COUNT"])
         opening = float(opening_balances.get(bank, 0.0))
         current_balance = opening + bank_in - bank_out
 
+        balances[bank] = {
+            "BAL": current_balance,
+            "IN": bank_in,
+            "OUT": bank_out,
+            "TX": cnt,
+            "OPENING": opening
+        }
+
+    meta = {
+        "success_count": success_count,
+        "cancelled_count": cancelled_count,
+        "total_in": total_in,
+        "total_out": total_out,
+        "net": total_in - total_out
+    }
+
+    return balances, meta
+
+
+def build_daily_summary(spreadsheet, target_date=None):
+    target_date = target_date or today_str()
+    balances, meta = calculate_bank_balances(spreadsheet, target_date)
+
+    lines = [f"<b>SUMMARY {target_date}</b>", ""]
+    lines.append(f"Success TX: <b>{meta['success_count']}</b>")
+    lines.append(f"Cancelled TX: <b>{meta['cancelled_count']}</b>")
+    lines.append(f"Total IN: <b>{format_amount(meta['total_in'])}</b>")
+    lines.append(f"Total OUT: <b>{format_amount(meta['total_out'])}</b>")
+    lines.append(f"Net: <b>{format_amount(meta['net'])}</b>")
+    lines.append("")
+
+    for bank in sorted(balances.keys()):
+        item = balances[bank]
         lines.append(
             f"<b>{bank}</b>\n"
-            f"BAL: {format_amount(current_balance)} | "
-            f"IN: {format_amount(bank_in)} | "
-            f"OUT: {format_amount(bank_out)} | "
-            f"TX: {cnt}"
+            f"BAL: {format_amount(item['BAL'])} | "
+            f"IN: {format_amount(item['IN'])} | "
+            f"OUT: {format_amount(item['OUT'])} | "
+            f"TX: {item['TX']}"
         )
 
     return "\n".join(lines)
 
 
+def get_single_bank_balance(spreadsheet, bank_code, target_date=None):
+    bank_code = normalize_bank_code(bank_code)
+    balances, _ = calculate_bank_balances(spreadsheet, target_date or today_str())
+    return balances.get(bank_code, {
+        "BAL": 0.0,
+        "IN": 0.0,
+        "OUT": 0.0,
+        "TX": 0,
+        "OPENING": 0.0
+    })
+
+
 def send_auto_report(spreadsheet):
     if not BOT_REPORT_CHAT_ID:
+        log_message("WARNING", "BOT_REPORT_CHAT_ID is empty, auto summary skipped.")
         return
+
     try:
         text = build_daily_summary(spreadsheet, today_str())
-        send_message(BOT_REPORT_CHAT_ID, text)
+        resp = send_message(BOT_REPORT_CHAT_ID, text)
+        if resp is not None and not resp.ok:
+            log_message("ERROR", f"Auto summary send failed: {resp.text}")
     except Exception as e:
         log_message("ERROR", f"Failed to send auto report: {e}")
 
@@ -434,14 +468,17 @@ def handle_new_reply_transaction(chat_id, message, text):
         tx_type=parsed["type"]
     )
 
+    bank_balance = get_single_bank_balance(spreadsheet, parsed["bank_code"], today_str())
+
     send_message(
         chat_id,
         f"✅ <b>TRANSACTION SUCCESS</b>\n\n"
-        f"Member : <b>{full_name}</b>\n"
-        f"Bank   : <b>{parsed['bank_code']}</b>\n"
-        f"Type   : <b>{parsed['type']}</b>\n"
-        f"Amount : <b>{format_amount(parsed['amount'])}</b>\n\n"
-        f"TX_ID  : <code>{tx_id}</code>",
+        f"Member  : <b>{full_name}</b>\n"
+        f"Bank    : <b>{parsed['bank_code']}</b>\n"
+        f"Type    : <b>{parsed['type']}</b>\n"
+        f"Amount  : <b>{format_amount(parsed['amount'])}</b>\n"
+        f"Balance : <b>{format_amount(bank_balance['BAL'])}</b>\n\n"
+        f"TX_ID   : <code>{tx_id}</code>",
         reply_to_message_id=message.get("message_id")
     )
 
@@ -467,14 +504,18 @@ def handle_cancel(chat_id, text, reply_to_message_id=None):
         send_message(chat_id, f"❌ {result}", reply_to_message_id=reply_to_message_id)
         return
 
+    bank_code = normalize_bank_code(result.get("BANK_CODE", ""))
+    bank_balance = get_single_bank_balance(spreadsheet, bank_code, today_str())
+
     send_message(
         chat_id,
         f"✅ <b>TRANSACTION CANCELLED</b>\n\n"
-        f"Member : <b>{result.get('FULL_NAME', '')}</b>\n"
-        f"Bank   : <b>{result.get('BANK_CODE', '')}</b>\n"
-        f"Type   : <b>{result.get('TYPE', '')}</b>\n"
-        f"Amount : <b>{format_amount(parse_amount(result.get('AMOUNT', 0)))}</b>\n\n"
-        f"TX_ID  : <code>{tx_id}</code>",
+        f"Member  : <b>{result.get('FULL_NAME', '')}</b>\n"
+        f"Bank    : <b>{bank_code}</b>\n"
+        f"Type    : <b>{result.get('TYPE', '')}</b>\n"
+        f"Amount  : <b>{format_amount(parse_amount(result.get('AMOUNT', 0)))}</b>\n"
+        f"Balance : <b>{format_amount(bank_balance['BAL'])}</b>\n\n"
+        f"TX_ID   : <code>{tx_id}</code>",
         reply_to_message_id=reply_to_message_id
     )
 
