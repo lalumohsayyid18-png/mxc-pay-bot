@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 
 import gspread
 import requests
-from flask import Flask, request
+from flask import Flask, request, jsonify
 from google.oauth2.service_account import Credentials
 
 app = Flask(__name__)
@@ -14,9 +14,16 @@ app = Flask(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "").strip()
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "").strip()
+BOT_REPORT_CHAT_ID = os.environ.get("BOT_REPORT_CHAT_ID", "").strip()
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-DEFAULT_TIMEZONE = "Asia/Kuala_Lumpur"
+DEFAULT_TIMEZONE = os.environ.get("DEFAULT_TIMEZONE", "Asia/Kuala_Lumpur")
+
+MAIN_SHEET_NAME = "TRANSAKSI"
+LOG_SHEET_NAME = "LOG"
+
+MAIN_HEADERS = ["DATE", "TIME", "TX_ID", "TYPE", "FULL_NAME", "AMOUNT", "BANK_CODE", "STATUS"]
+BANK_HEADERS = ["DATE", "FULL_NAME", "AMOUNT"]
 
 
 def now_local():
@@ -24,6 +31,14 @@ def now_local():
         return datetime.now(ZoneInfo(DEFAULT_TIMEZONE))
     except Exception:
         return datetime.now()
+
+
+def today_str():
+    return now_local().strftime("%Y-%m-%d")
+
+
+def time_str():
+    return now_local().strftime("%H:%M:%S")
 
 
 def get_client():
@@ -37,465 +52,496 @@ def get_spreadsheet():
     return client.open_by_key(SPREADSHEET_ID)
 
 
-def get_sheet(name):
-    return get_spreadsheet().worksheet(name)
+def safe_sheet_title(name: str) -> str:
+    name = (name or "").strip().upper()
+    name = re.sub(r"[\[\]\*\?\/\\:]", "", name)
+    return name[:100] if name else "UNKNOWN"
 
 
-def get_settings():
-    data = {}
+def get_or_create_sheet(spreadsheet, title, rows=1000, cols=20):
     try:
-        ws = get_sheet("SETTINGS")
-        rows = ws.get_all_values()
-        for row in rows[1:]:
-            key = str(row[0]).strip() if len(row) > 0 else ""
-            val = str(row[1]).strip() if len(row) > 1 else ""
-            if key:
-                data[key] = val
+        ws = spreadsheet.worksheet(title)
+    except Exception:
+        ws = spreadsheet.add_worksheet(title=title, rows=str(rows), cols=str(cols))
+    return ws
+
+
+def ensure_headers(ws, headers):
+    current = ws.row_values(1)
+    if current != headers:
+        if not current:
+            ws.append_row(headers, value_input_option="USER_ENTERED")
+        else:
+            ws.update("A1", [headers])
+
+
+def get_main_sheet(spreadsheet):
+    ws = get_or_create_sheet(spreadsheet, MAIN_SHEET_NAME, rows=5000, cols=20)
+    ensure_headers(ws, MAIN_HEADERS)
+    return ws
+
+
+def get_log_sheet(spreadsheet):
+    ws = get_or_create_sheet(spreadsheet, LOG_SHEET_NAME, rows=2000, cols=10)
+    if not ws.row_values(1):
+        ws.append_row(["DATE", "TIME", "LEVEL", "MESSAGE"], value_input_option="USER_ENTERED")
+    return ws
+
+
+def get_bank_sheet(spreadsheet, bank_code):
+    title = safe_sheet_title(bank_code)
+    ws = get_or_create_sheet(spreadsheet, title, rows=3000, cols=5)
+    ensure_headers(ws, BANK_HEADERS)
+    return ws
+
+
+def log_message(level, message):
+    try:
+        spreadsheet = get_spreadsheet()
+        ws = get_log_sheet(spreadsheet)
+        ws.append_row([today_str(), time_str(), level, str(message)], value_input_option="USER_ENTERED")
     except Exception:
         pass
-    return data
 
 
-def log_message(level, message, raw=""):
-    print(f"[{level}] {message} {raw}", flush=True)
+def telegram_api(method, payload):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    return requests.post(url, json=payload, timeout=30)
 
-    # hanya ERROR yang disimpan ke Google Sheet
-    if level != "ERROR":
+
+def send_message(chat_id, text, reply_to_message_id=None):
+    if not BOT_TOKEN or not chat_id:
         return
-
-    try:
-        ws = get_sheet("LOG")
-        t = now_local().strftime("%Y-%m-%d %H:%M:%S")
-        ws.append_row([t, level, message, raw])
-    except Exception:
-        pass
-
-
-def send_message(chat_id, text, thread_id=None):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": str(chat_id),
-        "text": text
+        "text": text,
+        "parse_mode": "HTML"
     }
+    if reply_to_message_id:
+        payload["reply_to_message_id"] = reply_to_message_id
+    telegram_api("sendMessage", payload)
 
-    if thread_id not in (None, "", "0"):
-        payload["message_thread_id"] = int(thread_id)
 
+def format_amount(value):
     try:
-        res = requests.post(url, json=payload, timeout=30)
-        print(f"[TG] sendMessage {res.text}", flush=True)
-    except Exception as e:
-        log_message("ERROR", "sendMessage_failed", str(e))
-
-
-def extract_message_text(msg):
-    if not msg:
-        return ""
-    return (msg.get("text") or msg.get("caption") or "").strip()
-
-
-def parse_amount(value):
-    s = str(value).strip()
-    if not s:
-        return 0.0
-
-    s = s.replace(" ", "")
-
-    if "," in s and "." in s:
-        if s.rfind(",") > s.rfind("."):
-            # contoh: 1.234,56
-            s = s.replace(".", "").replace(",", ".")
-        else:
-            # contoh: 1,234.56
-            s = s.replace(",", "")
-    elif "," in s:
-        # contoh: 646,02
-        s = s.replace(",", ".")
-
-    try:
-        return float(s)
+        num = float(str(value).replace(",", "").strip())
+        return f"{num:,.2f}"
     except Exception:
-        return 0.0
+        return str(value)
 
 
-def get_bank_rows():
-    ws = get_sheet("BANK_LIST")
-    rows = ws.get_all_values()
-    out = []
-
-    for row in rows[1:]:
-        code = str(row[0]).strip().upper() if len(row) > 0 else ""
-        name = str(row[1]).strip() if len(row) > 1 else code
-        active = str(row[2]).strip().upper() if len(row) > 2 else ""
-        opening_balance = 0.0
-
-        if len(row) > 3 and str(row[3]).strip():
-            opening_balance = parse_amount(row[3])
-
-        if code and active == "YES":
-            out.append({
-                "bankCode": code,
-                "bankName": name or code,
-                "openingBalance": opening_balance
-            })
-
-    return out
-
-
-def get_bank_info(bank_code):
-    bank_code = str(bank_code).strip().upper()
-    for bank in get_bank_rows():
-        if bank["bankCode"] == bank_code:
-            return bank
-    return None
-
-
-def get_active_bank_codes():
-    return [b["bankCode"] for b in get_bank_rows()]
+def parse_amount(raw):
+    text = str(raw).strip().replace(",", "")
+    return float(text)
 
 
 def generate_tx_id(tx_type):
-    ws = get_sheet("TRANSAKSI")
-    rows = ws.get_all_values()
-    date_part = now_local().strftime("%Y%m%d")
-    prefix = f"{tx_type}{date_part}"
-    max_num = 0
-
-    for row in rows[1:]:
-        tx_id = str(row[2]).strip() if len(row) > 2 else ""
-        if tx_id.startswith(prefix):
-            tail = tx_id.replace(prefix, "")
-            if tail.isdigit():
-                max_num = max(max_num, int(tail))
-
-    return f"{prefix}{str(max_num + 1).zfill(4)}"
+    prefix = "IN" if tx_type == "IN" else "OUT"
+    return f"{prefix}{now_local().strftime('%Y%m%d%H%M%S%f')[:-3]}"
 
 
-def get_bank_total_balance(bank_code):
-    bank_code = str(bank_code).strip().upper()
-
-    opening_balance = 0.0
-    for bank in get_bank_rows():
-        if bank["bankCode"] == bank_code:
-            opening_balance = float(bank.get("openingBalance", 0.0))
-            break
-
-    tx_ws = get_sheet("TRANSAKSI")
-    rows = tx_ws.get_all_values()
-
-    balance = opening_balance
-
-    for row in rows[1:]:
-        tx_type = str(row[3]).strip().upper() if len(row) > 3 else ""
-        amount = parse_amount(row[5]) if len(row) > 5 else 0.0
-        row_bank_code = str(row[6]).strip().upper() if len(row) > 6 else ""
-        status = str(row[7]).strip() if len(row) > 7 else ""
-
-        if status != "Success":
-            continue
-        if row_bank_code != bank_code:
-            continue
-
-        if tx_type == "IN":
-            balance += amount
-        elif tx_type == "OUT":
-            balance -= amount
-
-    return balance
+def normalize_bank_code(text):
+    return safe_sheet_title(text)
 
 
-def parse_tx_command(text):
-    m = re.match(r"^([+-])\s*(\d+(?:[.,]\d+)?)\s+([A-Za-z0-9_]+)$", text.strip())
+def parse_reply_transaction_input(text):
+    """
+    Format:
+    +100 TERRI
+    -100 TERRI
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+
+    m = re.match(r"^([+-])\s*([\d.,]+)\s+([A-Za-z0-9_\-]+)$", text, re.IGNORECASE)
     if not m:
         return None
 
+    sign, amount_raw, bank_code = m.groups()
+    tx_type = "IN" if sign == "+" else "OUT"
+
     return {
-        "type": "IN" if m.group(1) == "+" else "OUT",
-        "amount": parse_amount(m.group(2)),
-        "bankCode": m.group(3).upper()
+        "type": tx_type,
+        "amount": parse_amount(amount_raw),
+        "bank_code": normalize_bank_code(bank_code)
     }
 
 
-def parse_cancel_command(text):
-    m = re.match(r"^(?:cancel|batal)\s+([A-Za-z0-9]+)$", text.strip(), re.IGNORECASE)
-    if not m:
-        return None
-    return m.group(1).upper()
+def extract_full_name_from_replied_message(message):
+    reply = message.get("reply_to_message")
+    if not reply:
+        return ""
+
+    full_name = (reply.get("text") or reply.get("caption") or "").strip()
+    return full_name
 
 
-def cancel_transaction(tx_id):
-    tx_id = str(tx_id).strip().upper()
-    ws = get_sheet("TRANSAKSI")
-    rows = ws.get_all_values()
-
-    for idx, row in enumerate(rows[1:], start=2):
-        row_tx_id = str(row[2]).strip().upper() if len(row) > 2 else ""
-        if row_tx_id != tx_id:
-            continue
-
-        tx_date = str(row[0]).strip() if len(row) > 0 else ""
-        tx_time = str(row[1]).strip() if len(row) > 1 else ""
-        tx_type = str(row[3]).strip().upper() if len(row) > 3 else ""
-        member_name = str(row[4]).strip() if len(row) > 4 else ""
-        amount = parse_amount(row[5]) if len(row) > 5 else 0.0
-        bank_code = str(row[6]).strip().upper() if len(row) > 6 else ""
-        status = str(row[7]).strip() if len(row) > 7 else ""
-
-        if status == "Cancelled":
-            return {"ok": False, "reason": "already_cancelled"}
-
-        if status != "Success":
-            return {"ok": False, "reason": f"invalid_status_{status}"}
-
-        ws.update_cell(idx, 8, "Cancelled")
-
-        return {
-            "ok": True,
-            "tx_id": row_tx_id,
-            "date": tx_date,
-            "time": tx_time,
-            "type": tx_type,
-            "name": member_name,
-            "amount": amount,
-            "bank_code": bank_code,
-            "status": "Cancelled"
-        }
-
-    return {"ok": False, "reason": "not_found"}
+def append_main_transaction(spreadsheet, tx_id, tx_type, full_name, amount, bank_code, status="Success"):
+    ws = get_main_sheet(spreadsheet)
+    row = [
+        today_str(),
+        time_str(),
+        tx_id,
+        tx_type,
+        full_name,
+        amount,
+        bank_code,
+        status
+    ]
+    ws.append_row(row, value_input_option="USER_ENTERED")
+    return row
 
 
-def build_summary_text():
-    tx_ws = get_sheet("TRANSAKSI")
-    rows = tx_ws.get_all_values()
-    banks = get_bank_rows()
-    today = now_local().strftime("%Y-%m-%d")
+def append_bank_transaction(spreadsheet, bank_code, full_name, amount, tx_type):
+    """
+    DATE | FULL_NAME | AMOUNT
+    IN  => positif
+    OUT => negatif
+    """
+    ws = get_bank_sheet(spreadsheet, bank_code)
+
+    signed_amount = float(amount)
+    if tx_type == "OUT":
+        signed_amount = -abs(signed_amount)
+    else:
+        signed_amount = abs(signed_amount)
+
+    ws.append_row(
+        [today_str(), full_name, signed_amount],
+        value_input_option="USER_ENTERED"
+    )
+
+
+def find_tx_row_by_id(ws, tx_id):
+    col_values = ws.col_values(3)  # TX_ID col C
+    for idx, value in enumerate(col_values, start=1):
+        if str(value).strip() == str(tx_id).strip():
+            return idx
+    return None
+
+
+def get_row_dict_by_index(ws, row_index):
+    headers = ws.row_values(1)
+    values = ws.row_values(row_index)
+    data = {}
+    for i, key in enumerate(headers):
+        data[key] = values[i] if i < len(values) else ""
+    return data
+
+
+def cancel_transaction(spreadsheet, tx_id):
+    ws = get_main_sheet(spreadsheet)
+    row_index = find_tx_row_by_id(ws, tx_id)
+    if not row_index or row_index == 1:
+        return False, "TX_ID tidak ditemukan."
+
+    data = get_row_dict_by_index(ws, row_index)
+    current_status = str(data.get("STATUS", "")).strip().lower()
+    if current_status == "cancelled":
+        return False, "TX_ID ini sudah pernah dicancel."
+
+    ws.update_cell(row_index, 8, "Cancelled")
+
+    try:
+        tx_type = str(data.get("TYPE", "")).strip().upper()
+        amount = parse_amount(data.get("AMOUNT", "0"))
+        bank_code = normalize_bank_code(data.get("BANK_CODE", "UNKNOWN"))
+        full_name = str(data.get("FULL_NAME", "")).strip()
+
+        reverse_type = "OUT" if tx_type == "IN" else "IN"
+        reversal_name = f"CANCEL {full_name}"
+        append_bank_transaction(spreadsheet, bank_code, reversal_name, amount, reverse_type)
+    except Exception as e:
+        log_message("ERROR", f"Gagal append reversal bank sheet untuk {tx_id}: {e}")
+
+    return True, data
+
+
+def get_all_main_records(spreadsheet):
+    ws = get_main_sheet(spreadsheet)
+    rows = ws.get_all_records()
+    cleaned = []
+    for row in rows:
+        cleaned.append({
+            "DATE": str(row.get("DATE", "")).strip(),
+            "TIME": str(row.get("TIME", "")).strip(),
+            "TX_ID": str(row.get("TX_ID", "")).strip(),
+            "TYPE": str(row.get("TYPE", "")).strip().upper(),
+            "FULL_NAME": str(row.get("FULL_NAME", "")).strip(),
+            "AMOUNT": row.get("AMOUNT", 0),
+            "BANK_CODE": normalize_bank_code(str(row.get("BANK_CODE", "")).strip()),
+            "STATUS": str(row.get("STATUS", "")).strip()
+        })
+    return cleaned
+
+
+def build_daily_summary(spreadsheet, target_date=None):
+    target_date = target_date or today_str()
+    rows = get_all_main_records(spreadsheet)
 
     summary = {}
-    for b in banks:
-        summary[b["bankCode"]] = {
-            "name": b["bankName"],
-            "today_in": 0.0,
-            "today_out": 0.0,
-            "opening_balance": float(b.get("openingBalance", 0.0)),
-            "total_balance": float(b.get("openingBalance", 0.0)),
-            "today_in_count": 0,
-            "today_out_count": 0
-        }
+    total_in = 0.0
+    total_out = 0.0
+    success_count = 0
+    cancelled_count = 0
 
-    total_today_in = 0.0
-    total_today_out = 0.0
-    total_today_in_count = 0
-    total_today_out_count = 0
-
-    for row in rows[1:]:
-        row_date = str(row[0]).strip() if len(row) > 0 else ""
-        tx_type = str(row[3]).strip().upper() if len(row) > 3 else ""
-        amount = parse_amount(row[5]) if len(row) > 5 else 0.0
-        bank_code = str(row[6]).strip().upper() if len(row) > 6 else ""
-        status = str(row[7]).strip() if len(row) > 7 else ""
-
-        if status != "Success":
-            continue
-        if bank_code not in summary:
+    for row in rows:
+        if row["DATE"] != target_date:
             continue
 
-        if tx_type == "IN":
-            summary[bank_code]["total_balance"] += amount
-        elif tx_type == "OUT":
-            summary[bank_code]["total_balance"] -= amount
+        bank = row["BANK_CODE"] or "UNKNOWN"
+        if bank not in summary:
+            summary[bank] = {"IN": 0.0, "OUT": 0.0, "COUNT": 0}
 
-        if row_date == today:
-            if tx_type == "IN":
-                summary[bank_code]["today_in"] += amount
-                summary[bank_code]["today_in_count"] += 1
-                total_today_in += amount
-                total_today_in_count += 1
-            elif tx_type == "OUT":
-                summary[bank_code]["today_out"] += amount
-                summary[bank_code]["today_out_count"] += 1
-                total_today_out += amount
-                total_today_out_count += 1
+        try:
+            amount = parse_amount(row["AMOUNT"])
+        except Exception:
+            amount = 0.0
 
-    def fmt(n):
-        return f"{n:,.2f}"
+        status = row["STATUS"].strip().lower()
+        if status == "success":
+            success_count += 1
+            summary[bank]["COUNT"] += 1
+            if row["TYPE"] == "IN":
+                summary[bank]["IN"] += amount
+                total_in += amount
+            elif row["TYPE"] == "OUT":
+                summary[bank]["OUT"] += amount
+                total_out += amount
+        elif status == "cancelled":
+            cancelled_count += 1
 
-    lines = ["📊 DAILY SUMMARY", f"📅 Date: {today}", ""]
+    lines = [f"<b>SUMMARY {target_date}</b>", ""]
+    lines.append(f"Success TX: <b>{success_count}</b>")
+    lines.append(f"Cancelled TX: <b>{cancelled_count}</b>")
+    lines.append(f"Total IN: <b>{format_amount(total_in)}</b>")
+    lines.append(f"Total OUT: <b>{format_amount(total_out)}</b>")
+    lines.append(f"Net: <b>{format_amount(total_in - total_out)}</b>")
+    lines.append("")
 
-    for _, item in summary.items():
-        lines.append(f"🏦 {item['name']}")
-        lines.append(f"📥 IN ({item['today_in_count']}#): {fmt(item['today_in'])}")
-        lines.append(f"📤 OUT ({item['today_out_count']}#): {fmt(item['today_out'])}")
-        lines.append(f"💰 TOTAL BALANCE: {fmt(item['total_balance'])}")
-        lines.append("")
-
-    lines.append("━━━━━━━━━━━━━━")
-    lines.append(f"📈 TOTAL IN ({total_today_in_count}#): {fmt(total_today_in)}")
-    lines.append(f"📉 TOTAL OUT ({total_today_out_count}#): {fmt(total_today_out)}")
-    lines.append(f"💵 REMAINDER: {fmt(total_today_in - total_today_out)}")
+    if summary:
+        for bank in sorted(summary.keys()):
+            bank_in = summary[bank]["IN"]
+            bank_out = summary[bank]["OUT"]
+            bank_net = bank_in - bank_out
+            cnt = summary[bank]["COUNT"]
+            lines.append(
+                f"<b>{bank}</b>\n"
+                f"IN: {format_amount(bank_in)} | "
+                f"OUT: {format_amount(bank_out)} | "
+                f"NET: {format_amount(bank_net)} | "
+                f"TX: {cnt}"
+            )
+    else:
+        lines.append("Belum ada transaksi.")
 
     return "\n".join(lines)
 
 
-def send_report_summary(settings):
-    report_chat_id = str(settings.get("REPORT_CHAT_ID", "")).strip()
-    report_topic_id = str(settings.get("REPORT_TOPIC_ID", "")).strip()
-    allowed_chat_id = str(settings.get("ALLOWED_CHAT_ID", "")).strip()
+def send_auto_report(spreadsheet):
+    if not BOT_REPORT_CHAT_ID:
+        return
+    try:
+        text = build_daily_summary(spreadsheet, today_str())
+        send_message(BOT_REPORT_CHAT_ID, text)
+    except Exception as e:
+        log_message("ERROR", f"Gagal kirim auto report: {e}")
 
-    target_chat_id = report_chat_id or allowed_chat_id
-    target_thread_id = report_topic_id or None
 
-    if not target_chat_id:
+def handle_new_reply_transaction(chat_id, message, text):
+    parsed = parse_reply_transaction_input(text)
+    if not parsed:
+        return False
+
+    reply = message.get("reply_to_message")
+    if not reply:
+        send_message(
+            chat_id,
+            "Format transaksi harus reply ke pesan nama.\n\n"
+            "Contoh:\n"
+            "1. kirim nama: <code>abog boba</code>\n"
+            "2. lalu reply: <code>+100 TERRI</code>"
+        )
+        return True
+
+    full_name = extract_full_name_from_replied_message(message)
+    if not full_name:
+        send_message(chat_id, "Nama di pesan yang direply kosong / tidak terbaca.")
+        return True
+
+    spreadsheet = get_spreadsheet()
+    tx_id = generate_tx_id(parsed["type"])
+
+    append_main_transaction(
+        spreadsheet=spreadsheet,
+        tx_id=tx_id,
+        tx_type=parsed["type"],
+        full_name=full_name,
+        amount=parsed["amount"],
+        bank_code=parsed["bank_code"],
+        status="Success"
+    )
+
+    append_bank_transaction(
+        spreadsheet=spreadsheet,
+        bank_code=parsed["bank_code"],
+        full_name=full_name,
+        amount=parsed["amount"],
+        tx_type=parsed["type"]
+    )
+
+    signed_preview = parsed["amount"] if parsed["type"] == "IN" else -abs(parsed["amount"])
+
+    send_message(
+        chat_id,
+        f"✅ <b>TRANSAKSI BERHASIL</b>\n\n"
+        f"TX_ID: <code>{tx_id}</code>\n"
+        f"Type: <b>{parsed['type']}</b>\n"
+        f"Name: <b>{full_name}</b>\n"
+        f"Bank: <b>{parsed['bank_code']}</b>\n"
+        f"Amount: <b>{format_amount(parsed['amount'])}</b>\n"
+        f"Catatan bank: <b>{parsed['bank_code']}</b> → {format_amount(signed_preview)}",
+        reply_to_message_id=message.get("message_id")
+    )
+
+    send_auto_report(spreadsheet)
+    return True
+
+
+def handle_cancel(chat_id, text):
+    m = re.match(r"^(?:/cancel|cancel)\s+([A-Za-z0-9]+)$", text.strip(), re.IGNORECASE)
+    if not m:
+        send_message(chat_id, "Format cancel salah.\nContoh: <code>/cancel IN20260314123000123</code>")
         return
 
-    summary_text = build_summary_text()
-    send_message(target_chat_id, summary_text, target_thread_id)
+    tx_id = m.group(1).strip()
+    spreadsheet = get_spreadsheet()
+    ok, result = cancel_transaction(spreadsheet, tx_id)
+
+    if not ok:
+        send_message(chat_id, f"❌ {result}")
+        return
+
+    send_message(
+        chat_id,
+        f"✅ <b>TRANSAKSI DICANCEL</b>\n\n"
+        f"TX_ID: <code>{tx_id}</code>\n"
+        f"Name: <b>{result.get('FULL_NAME', '')}</b>\n"
+        f"Bank: <b>{result.get('BANK_CODE', '')}</b>\n"
+        f"Type asal: <b>{result.get('TYPE', '')}</b>\n"
+        f"Amount asal: <b>{format_amount(result.get('AMOUNT', 0))}</b>\n\n"
+        f"Reversal sudah ditambahkan ke sheet bank."
+    )
+
+    send_auto_report(spreadsheet)
+
+
+def handle_summary(chat_id, text):
+    spreadsheet = get_spreadsheet()
+    m = re.match(r"^(?:/summary|summary)(?:\s+(\d{4}-\d{2}-\d{2}))?$", text.strip(), re.IGNORECASE)
+    target_date = today_str()
+    if m and m.group(1):
+        target_date = m.group(1)
+
+    summary_text = build_daily_summary(spreadsheet, target_date)
+    send_message(chat_id, summary_text)
+
+
+def handle_help(chat_id):
+    text = (
+        "<b>FORMAT BOT</b>\n\n"
+        "Flow input transaksi:\n"
+        "1. kirim nama dulu\n"
+        "<code>abog boba</code>\n\n"
+        "2. lalu reply ke pesan nama itu:\n"
+        "<code>+100 TERRI</code>\n"
+        "<code>-100 NEXA</code>\n\n"
+        "Cancel transaksi:\n"
+        "<code>/cancel TX_ID</code>\n\n"
+        "Summary hari ini:\n"
+        "<code>/summary</code>\n\n"
+        "Summary tanggal tertentu:\n"
+        "<code>/summary 2026-03-14</code>"
+    )
+    send_message(chat_id, text)
+
+
+def process_telegram_update(update):
+    message = update.get("message") or update.get("edited_message") or {}
+    if not message:
+        return
+
+    chat = message.get("chat", {})
+    chat_id = chat.get("id")
+    text = (message.get("text") or message.get("caption") or "").strip()
+
+    if not chat_id or not text:
+        return
+
+    try:
+        if re.match(r"^/(start|help)$", text, re.IGNORECASE):
+            handle_help(chat_id)
+            return
+
+        if re.match(r"^(?:/summary|summary)(?:\s+\d{4}-\d{2}-\d{2})?$", text, re.IGNORECASE):
+            handle_summary(chat_id, text)
+            return
+
+        if re.match(r"^(?:/cancel|cancel)\s+[A-Za-z0-9]+$", text, re.IGNORECASE):
+            handle_cancel(chat_id, text)
+            return
+
+        if handle_new_reply_transaction(chat_id, message, text):
+            return
+
+    except Exception as e:
+        log_message("ERROR", f"process_telegram_update error: {e}")
+        send_message(chat_id, f"❌ Error: <code>{str(e)}</code>")
+
 
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Bot running", 200
+    return jsonify({"ok": True, "message": "Telegram payment gateway bot running"}), 200
 
 
-@app.route("/", methods=["POST"])
+@app.route("/webhook", methods=["POST"])
 def webhook():
     try:
-        data = request.get_json(silent=True) or {}
-        print(f"[INFO] incoming {json.dumps(data)}", flush=True)
-
-        message = data.get("message") or data.get("edited_message")
-        if not message:
-            return "ok", 200
-
-        settings = get_settings()
-        allowed_chat_id = str(settings.get("ALLOWED_CHAT_ID", "")).strip()
-
-        chat_id = str(message.get("chat", {}).get("id", "")).strip()
-        thread_id = message.get("message_thread_id")
-        text = extract_message_text(message)
-
-        print(f"[INFO] text {text}", flush=True)
-
-        if allowed_chat_id and chat_id != allowed_chat_id:
-            print(f"[WARN] unauthorized_chat {chat_id}", flush=True)
-            return "ok", 200
-
-        if not text:
-            return "ok", 200
-
-        if text.lower() == "where":
-            reply = f"CHAT_ID: {chat_id}\nTOPIC_ID: {thread_id}\nTEXT: {text}"
-            send_message(chat_id, reply, thread_id)
-            return "ok", 200
-
-        if text.lower() == "summary":
-            send_message(chat_id, build_summary_text(), thread_id)
-            return "ok", 200
-
-        cancel_tx_id = parse_cancel_command(text)
-        if cancel_tx_id:
-            result = cancel_transaction(cancel_tx_id)
-
-            if not result["ok"]:
-                if result["reason"] == "not_found":
-                    send_message(chat_id, f"TX_ID {cancel_tx_id} tidak ditemukan.", thread_id)
-                elif result["reason"] == "already_cancelled":
-                    send_message(chat_id, f"TX_ID {cancel_tx_id} sudah pernah dibatalkan.", thread_id)
-                else:
-                    send_message(chat_id, f"TX_ID {cancel_tx_id} gagal dibatalkan.", thread_id)
-                return "ok", 200
-
-            bank = get_bank_info(result["bank_code"])
-            bank_name = bank["bankName"] if bank else result["bank_code"]
-            bank_balance = get_bank_total_balance(result["bank_code"])
-
-            cancel_text = (
-                f"❌ TRANSACTION CANCELLED\n\n"
-                f"TX_ID: {result['tx_id']}\n"
-                f"Date: {result['date']} {result['time']}\n"
-                f"Type: {result['type']}\n"
-                f"Name: {result['name']}\n"
-                f"Amount: {result['amount']:,.2f}\n"
-                f"Bank: {bank_name}\n"
-                f"New Bank Balance: {bank_balance:,.2f}\n"
-                f"Status: Cancelled"
-            )
-
-            send_message(chat_id, cancel_text, thread_id)
-
-            try:
-                send_report_summary(settings)
-            except Exception as e:
-                log_message("ERROR", "send_report_summary_cancel_failed", str(e))
-
-            return "ok", 200
-
-        cmd = parse_tx_command(text)
-        if not cmd:
-            print(f"[INFO] ignored_text {text}", flush=True)
-            return "ok", 200
-
-        reply_msg = message.get("reply_to_message")
-        if not reply_msg:
-            send_message(chat_id, "Reply ke pesan nama member dulu.", thread_id)
-            return "ok", 200
-
-        raw_name = extract_message_text(reply_msg)
-        full_name = raw_name.split("\n")[0].strip()
-
-        if not full_name:
-            send_message(chat_id, "Nama member tidak ditemukan di pesan reply.", thread_id)
-            return "ok", 200
-
-        bank = get_bank_info(cmd["bankCode"])
-        if not bank:
-            send_message(
-                chat_id,
-                "Bank tidak valid.\nValid: " + ", ".join(get_active_bank_codes()),
-                thread_id
-            )
-            return "ok", 200
-
-        tx_id = generate_tx_id(cmd["type"])
-        now = now_local()
-
-        tx_ws = get_sheet("TRANSAKSI")
-        tx_ws.append_row([
-            now.strftime("%Y-%m-%d"),
-            now.strftime("%H:%M:%S"),
-            tx_id,
-            cmd["type"],
-            full_name,
-            cmd["amount"],
-            cmd["bankCode"],
-            "Success"
-        ])
-
-        bank_balance = get_bank_total_balance(cmd["bankCode"])
-
-        success_text = (
-            f"✅ {cmd['type']} SUCCESS\n\n"
-            f"TX_ID: {tx_id}\n"
-            f"Name: {full_name}\n"
-            f"Amount: {cmd['amount']:,.2f}\n"
-            f"Bank: {bank['bankName']}\n"
-            f"Bank Balance: {bank_balance:,.2f}\n"
-            f"Status: Success"
-        )
-
-        send_message(chat_id, success_text, thread_id)
-
-        try:
-            send_report_summary(settings)
-        except Exception as e:
-            log_message("ERROR", "send_report_summary_success_failed", str(e))
-
-        return "ok", 200
-
+        update = request.get_json(force=True, silent=True) or {}
+        process_telegram_update(update)
+        return jsonify({"ok": True}), 200
     except Exception as e:
-        log_message("ERROR", "webhook_error", str(e))
-        return "ok", 200
+        log_message("ERROR", f"webhook error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/set_webhook", methods=["GET"])
+def set_webhook():
+    webhook_url = os.environ.get("WEBHOOK_URL", "").strip()
+    if not webhook_url:
+        return jsonify({"ok": False, "error": "WEBHOOK_URL belum diisi"}), 400
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
+    resp = requests.post(url, json={"url": webhook_url}, timeout=30)
+    return jsonify(resp.json()), 200
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
+    if not BOT_TOKEN:
+        raise ValueError("BOT_TOKEN belum diisi.")
+    if not SPREADSHEET_ID:
+        raise ValueError("SPREADSHEET_ID belum diisi.")
+    if not GOOGLE_CREDENTIALS:
+        raise ValueError("GOOGLE_CREDENTIALS belum diisi.")
+
+    try:
+        ss = get_spreadsheet()
+        get_main_sheet(ss)
+        get_log_sheet(ss)
+    except Exception as e:
+        raise RuntimeError(f"Gagal akses Google Sheet: {e}")
+
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
