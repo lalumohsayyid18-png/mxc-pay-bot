@@ -131,7 +131,24 @@ def format_amount(value):
 
 
 def parse_amount(raw):
-    text = str(raw).strip().replace(",", "")
+    text = str(raw).strip().replace(" ", "")
+    if not text:
+        return 0.0
+
+    # kalau ada koma dan tidak ada titik,
+    # cek apakah koma kemungkinan desimal atau ribuan
+    if "," in text and "." not in text:
+        parts = text.split(",")
+        if len(parts) == 2 and len(parts[1]) in (1, 2):
+            # contoh: 600,5 / 505,94
+            text = text.replace(",", ".")
+        else:
+            # contoh: 1,000 / 12,500
+            text = text.replace(",", "")
+    elif "," in text and "." in text:
+        # contoh: 1,000.50
+        text = text.replace(",", "")
+
     return float(text)
 
 
