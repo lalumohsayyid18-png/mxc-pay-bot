@@ -136,10 +136,6 @@ def parse_amount(raw):
     if not text:
         return 0.0
 
-    # format campuran:
-    # 600,5 / 505,94 => desimal
-    # 1,000 / 12,500 => ribuan
-    # 1,000.50 => ribuan + desimal
     if "," in text and "." not in text:
         parts = text.split(",")
         if len(parts) == 2 and len(parts[1]) in (1, 2):
@@ -163,7 +159,7 @@ def normalize_bank_code(text):
 
 def parse_reply_transaction_input(text):
     """
-    Format valid:
+    Valid format:
     +100 TERRI
     -100 TERRI
     +500.27 HWD
@@ -212,11 +208,6 @@ def append_main_transaction(spreadsheet, tx_id, tx_type, full_name, amount, bank
 
 
 def append_bank_transaction(spreadsheet, bank_code, full_name, amount, tx_type):
-    """
-    DATE | FULL_NAME | AMOUNT
-    IN  => positif
-    OUT => negatif
-    """
     ws = get_bank_sheet(spreadsheet, bank_code)
 
     signed_amount = abs(float(amount))
@@ -230,7 +221,7 @@ def append_bank_transaction(spreadsheet, bank_code, full_name, amount, tx_type):
 
 
 def find_tx_row_by_id(ws, tx_id):
-    col_values = ws.col_values(3)  # TX_ID = col C
+    col_values = ws.col_values(3)
     for idx, value in enumerate(col_values, start=1):
         if str(value).strip() == str(tx_id).strip():
             return idx
@@ -250,17 +241,15 @@ def cancel_transaction(spreadsheet, tx_id):
     ws = get_main_sheet(spreadsheet)
     row_index = find_tx_row_by_id(ws, tx_id)
     if not row_index or row_index == 1:
-        return False, "TX_ID tidak ditemukan."
+        return False, "TX_ID not found."
 
     data = get_row_dict_by_index(ws, row_index)
     current_status = str(data.get("STATUS", "")).strip().lower()
     if current_status == "cancelled":
-        return False, "TX_ID ini sudah pernah dicancel."
+        return False, "This TX_ID has already been cancelled."
 
-    # update status di TRANSAKSI
     ws.update_cell(row_index, 8, "Cancelled")
 
-    # mirror reversal ke bank sheet biar catatan bank tetap netral
     try:
         tx_type = str(data.get("TYPE", "")).strip().upper()
         amount = parse_amount(data.get("AMOUNT", "0"))
@@ -271,7 +260,7 @@ def cancel_transaction(spreadsheet, tx_id):
         reversal_name = f"CANCEL {full_name}"
         append_bank_transaction(spreadsheet, bank_code, reversal_name, amount, reverse_type)
     except Exception as e:
-        log_message("ERROR", f"Gagal append reversal bank sheet untuk {tx_id}: {e}")
+        log_message("ERROR", f"Failed to append bank reversal for {tx_id}: {e}")
 
     return True, data
 
@@ -331,7 +320,6 @@ def build_daily_summary(spreadsheet, target_date=None):
     success_count = 0
     cancelled_count = 0
 
-    # tampilkan semua bank aktif dari BANK_LIST walaupun belum ada transaksi
     for bank_code in opening_balances.keys():
         summary[bank_code] = {"IN": 0.0, "OUT": 0.0, "COUNT": 0}
 
@@ -399,7 +387,7 @@ def send_auto_report(spreadsheet):
         text = build_daily_summary(spreadsheet, today_str())
         send_message(BOT_REPORT_CHAT_ID, text)
     except Exception as e:
-        log_message("ERROR", f"Gagal kirim auto report: {e}")
+        log_message("ERROR", f"Failed to send auto report: {e}")
 
 
 def handle_new_reply_transaction(chat_id, message, text):
@@ -411,7 +399,7 @@ def handle_new_reply_transaction(chat_id, message, text):
     if not reply:
         send_message(
             chat_id,
-            "Reply ke pesan nama dulu.\nContoh:\n<code>Walter jay</code>\nLalu reply:\n<code>+100 TERRI</code>",
+            "Please reply to the member name first.\n\nExample:\n<code>Walter jay</code>\nThen reply with:\n<code>+100 TERRI</code>",
             reply_to_message_id=message.get("message_id")
         )
         return True
@@ -420,7 +408,7 @@ def handle_new_reply_transaction(chat_id, message, text):
     if not full_name:
         send_message(
             chat_id,
-            "Nama pada pesan yang direply kosong / tidak terbaca.",
+            "The replied message has no readable name.",
             reply_to_message_id=message.get("message_id")
         )
         return True
@@ -448,12 +436,12 @@ def handle_new_reply_transaction(chat_id, message, text):
 
     send_message(
         chat_id,
-        f"✅ <b>TRANSAKSI BERHASIL</b>\n\n"
-        f"TX_ID: <code>{tx_id}</code>\n"
-        f"Type: <b>{parsed['type']}</b>\n"
-        f"Name: <b>{full_name}</b>\n"
-        f"Bank: <b>{parsed['bank_code']}</b>\n"
-        f"Amount: <b>{format_amount(parsed['amount'])}</b>",
+        f"✅ <b>TRANSACTION SUCCESS</b>\n\n"
+        f"Member : <b>{full_name}</b>\n"
+        f"Bank   : <b>{parsed['bank_code']}</b>\n"
+        f"Type   : <b>{parsed['type']}</b>\n"
+        f"Amount : <b>{format_amount(parsed['amount'])}</b>\n\n"
+        f"TX_ID  : <code>{tx_id}</code>",
         reply_to_message_id=message.get("message_id")
     )
 
@@ -466,7 +454,7 @@ def handle_cancel(chat_id, text, reply_to_message_id=None):
     if not m:
         send_message(
             chat_id,
-            "Format cancel salah.\nContoh: <code>/cancel IN20260314123000123</code>",
+            "Invalid cancel format.\nExample: <code>/cancel IN20260314123000123</code>",
             reply_to_message_id=reply_to_message_id
         )
         return
@@ -481,12 +469,12 @@ def handle_cancel(chat_id, text, reply_to_message_id=None):
 
     send_message(
         chat_id,
-        f"✅ <b>TRANSAKSI DICANCEL</b>\n\n"
-        f"TX_ID: <code>{tx_id}</code>\n"
-        f"Name: <b>{result.get('FULL_NAME', '')}</b>\n"
-        f"Bank: <b>{result.get('BANK_CODE', '')}</b>\n"
-        f"Type asal: <b>{result.get('TYPE', '')}</b>\n"
-        f"Amount asal: <b>{format_amount(parse_amount(result.get('AMOUNT', 0)))}</b>",
+        f"✅ <b>TRANSACTION CANCELLED</b>\n\n"
+        f"Member : <b>{result.get('FULL_NAME', '')}</b>\n"
+        f"Bank   : <b>{result.get('BANK_CODE', '')}</b>\n"
+        f"Type   : <b>{result.get('TYPE', '')}</b>\n"
+        f"Amount : <b>{format_amount(parse_amount(result.get('AMOUNT', 0)))}</b>\n\n"
+        f"TX_ID  : <code>{tx_id}</code>",
         reply_to_message_id=reply_to_message_id
     )
 
@@ -506,14 +494,14 @@ def handle_summary(chat_id, text, reply_to_message_id=None):
 
 def handle_help(chat_id, reply_to_message_id=None):
     text = (
-        "<b>FORMAT BOT</b>\n\n"
-        "1. kirim nama\n"
+        "<b>BOT FORMAT</b>\n\n"
+        "1. Send member name\n"
         "<code>Walter jay</code>\n\n"
-        "2. reply ke pesan nama itu:\n"
+        "2. Reply to that message with:\n"
         "<code>+100 TERRI</code>\n"
         "<code>-100 NEXA</code>\n"
         "<code>-500.27 HWD</code>\n\n"
-        "Cancel:\n"
+        "Cancel transaction:\n"
         "<code>/cancel TX_ID</code>\n\n"
         "Summary:\n"
         "<code>/summary</code>\n"
@@ -552,7 +540,6 @@ def process_telegram_update(update):
             handle_new_reply_transaction(chat_id, message, text)
             return
 
-        # selain command valid => ignore
         return
 
     except Exception as e:
@@ -580,7 +567,7 @@ def webhook():
 def set_webhook():
     webhook_url = os.environ.get("WEBHOOK_URL", "").strip()
     if not webhook_url:
-        return jsonify({"ok": False, "error": "WEBHOOK_URL belum diisi"}), 400
+        return jsonify({"ok": False, "error": "WEBHOOK_URL is not set"}), 400
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
     resp = requests.post(url, json={"url": webhook_url}, timeout=30)
@@ -589,18 +576,18 @@ def set_webhook():
 
 if __name__ == "__main__":
     if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN belum diisi.")
+        raise ValueError("BOT_TOKEN is not set.")
     if not SPREADSHEET_ID:
-        raise ValueError("SPREADSHEET_ID belum diisi.")
+        raise ValueError("SPREADSHEET_ID is not set.")
     if not GOOGLE_CREDENTIALS:
-        raise ValueError("GOOGLE_CREDENTIALS belum diisi.")
+        raise ValueError("GOOGLE_CREDENTIALS is not set.")
 
     try:
         ss = get_spreadsheet()
         get_main_sheet(ss)
         get_log_sheet(ss)
     except Exception as e:
-        raise RuntimeError(f"Gagal akses Google Sheet: {e}")
+        raise RuntimeError(f"Failed to access Google Sheet: {e}")
 
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
