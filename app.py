@@ -1,10 +1,6 @@
 import os
 import json
 import re
-import csv
-import threading
-import time
-from io import StringIO, BytesIO
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -24,544 +20,482 @@ DEFAULT_TIMEZONE = "Asia/Kuala_Lumpur"
 
 
 def now_local():
-    try:
-        return datetime.now(ZoneInfo(DEFAULT_TIMEZONE))
-    except Exception:
-        return datetime.now()
+try:
+return datetime.now(ZoneInfo(DEFAULT_TIMEZONE))
+except Exception:
+return datetime.now()
 
 
 def get_client():
-    creds_dict = json.loads(GOOGLE_CREDENTIALS)
-    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
-    return gspread.authorize(creds)
+creds_dict = json.loads(GOOGLE_CREDENTIALS)
+creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+return gspread.authorize(creds)
 
 
 def get_spreadsheet():
-    client = get_client()
-    return client.open_by_key(SPREADSHEET_ID)
+client = get_client()
+return client.open_by_key(SPREADSHEET_ID)
 
 
 def get_sheet(name):
-    return get_spreadsheet().worksheet(name)
+return get_spreadsheet().worksheet(name)
 
 
 def get_settings():
-    data = {}
-    try:
-        ws = get_sheet("SETTINGS")
-        rows = ws.get_all_values()
-        for r in rows[1:]:
-            key = str(r[0]).strip() if len(r) > 0 else ""
-            val = str(r[1]).strip() if len(r) > 1 else ""
-            if key:
-                data[key] = val
-    except Exception:
-        pass
-    return data
+data = {}
+try:
+ws = get_sheet("SETTINGS")
+rows = ws.get_all_values()
+for row in rows[1:]:
+key = str(row[0]).strip() if len(row) > 0 else ""
+val = str(row[1]).strip() if len(row) > 1 else ""
+if key:
+data[key] = val
+except Exception:
+pass
+return data
 
 
-def log_message(level, msg, raw=""):
-    print(f"[{level}] {msg} {raw}", flush=True)
+def log_message(level, message, raw=""):
+print(f"[{level}] {message} {raw}", flush=True)
 
-    if level != "ERROR":
-        return
+# hanya ERROR yang disimpan ke Google Sheet
+if level != "ERROR":
+return
 
-    try:
-        ws = get_sheet("LOG")
-        ws.append_row([
-            now_local().strftime("%Y-%m-%d %H:%M:%S"),
-            level,
-            msg,
-            raw
-        ])
-    except Exception:
-        pass
+try:
+ws = get_sheet("LOG")
+t = now_local().strftime("%Y-%m-%d %H:%M:%S")
+ws.append_row([t, level, message, raw])
+except Exception:
+pass
 
 
-def send_message(chat, text, topic=None):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+def send_message(chat_id, text, thread_id=None):
+url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+payload = {
+chat_id: str(chat_id),
+text: text
+}
 
-    payload = {
-        "chat_id": str(chat),
-        "text": text
-    }
+if thread_id not in (None, "", "0"):
+payload["message_thread_id"] = int(thread_id)
 
-    if topic not in (None, "", 0, "0"):
-        payload["message_thread_id"] = int(topic)
-
-    try:
-        requests.post(url, json=payload, timeout=30)
-    except Exception as e:
-        log_message("ERROR", "sendMessage_failed", str(e))
-
-
-def send_document(chat, file_bytes, filename, topic=None):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
-
-    data = {
-        "chat_id": str(chat)
-    }
-
-    if topic not in (None, "", 0, "0"):
-        data["message_thread_id"] = int(topic)
-
-    if isinstance(file_bytes, StringIO):
-        content = file_bytes.getvalue().encode("utf-8-sig")
-    elif isinstance(file_bytes, BytesIO):
-        content = file_bytes.getvalue()
-    else:
-        content = str(file_bytes).encode("utf-8-sig")
-
-    files = {
-        "document": (filename, content)
-    }
-
-    try:
-        requests.post(url, data=data, files=files, timeout=60)
-    except Exception as e:
-        log_message("ERROR", "sendDocument_failed", str(e))
+try:
+res = requests.post(url, json=payload, timeout=30)
+print(f"[TG] sendMessage {res.text}", flush=True)
+except Exception as e:
+log_message("ERROR", "sendMessage_failed", str(e))
 
 
 def extract_message_text(msg):
-    if not msg:
-        return ""
-    return (msg.get("text") or msg.get("caption") or "").strip()
+if not msg:
+return ""
+return (msg.get("text") or msg.get("caption") or "").strip()
 
 
-def parse_amount(v):
-    s = str(v).strip()
-    if not s:
-        return 0.0
+def parse_amount(value):
+s = str(value).strip()
+if not s:
+return 0.0
 
-    s = s.replace(" ", "")
+s = s.replace(" ", "")
 
-    if "," in s and "." in s:
-        if s.rfind(",") > s.rfind("."):
-            s = s.replace(".", "").replace(",", ".")
-        else:
-            s = s.replace(",", "")
-    elif "," in s:
-        s = s.replace(",", ".")
+if "," in s and "." in s:
+if s.rfind(",") > s.rfind("."):
+# contoh: 1.234,56
+s = s.replace(".", "").replace(",", ".")
+else:
+# contoh: 1,234.56
+s = s.replace(",", "")
+elif "," in s:
+# contoh: 646,02
+s = s.replace(",", ".")
 
-    try:
-        return float(s)
-    except Exception:
-        return 0.0
+try:
+return float(s)
+except Exception:
+return 0.0
 
 
 def get_bank_rows():
-    ws = get_sheet("BANK_LIST")
-    rows = ws.get_all_values()
+ws = get_sheet("BANK_LIST")
+rows = ws.get_all_values()
+out = []
 
-    banks = []
+for row in rows[1:]:
+code = str(row[0]).strip().upper() if len(row) > 0 else ""
+name = str(row[1]).strip() if len(row) > 1 else code
+active = str(row[2]).strip().upper() if len(row) > 2 else ""
+opening_balance = 0.0
 
-    for r in rows[1:]:
-        code = str(r[0]).strip().upper() if len(r) > 0 else ""
-        name = str(r[1]).strip() if len(r) > 1 else code
-        active = str(r[2]).strip().upper() if len(r) > 2 else ""
-        opening = parse_amount(r[3]) if len(r) > 3 else 0.0
+if len(row) > 3 and str(row[3]).strip():
+opening_balance = parse_amount(row[3])
 
-        if code and active == "YES":
-            banks.append({
-                "bankCode": code,
-                "bankName": name or code,
-                "openingBalance": opening
-            })
+if code and active == "YES":
+out.append({
+bankCode: code,
+bankName: name or code,
+openingBalance: opening_balance
+})
 
-    return banks
+return out
 
 
-def get_bank_info(code):
-    code = str(code).strip().upper()
-    for b in get_bank_rows():
-        if b["bankCode"] == code:
-            return b
-    return None
+def get_bank_info(bank_code):
+bank_code = str(bank_code).strip().upper()
+for bank in get_bank_rows():
+if bank["bankCode"] == bank_code:
+return bank
+return None
 
 
 def get_active_bank_codes():
-    return [b["bankCode"] for b in get_bank_rows()]
+return [b["bankCode"] for b in get_bank_rows()]
 
 
 def generate_tx_id(tx_type):
-    ws = get_sheet("TRANSAKSI")
-    rows = ws.get_all_values()
+ws = get_sheet("TRANSAKSI")
+rows = ws.get_all_values()
+date_part = now_local().strftime("%Y%m%d")
+prefix = f"{tx_type}{date_part}"
+max_num = 0
 
-    prefix = f"{tx_type}{now_local().strftime('%Y%m%d')}"
-    num = 0
+for row in rows[1:]:
+tx_id = str(row[2]).strip() if len(row) > 2 else ""
+if tx_id.startswith(prefix):
+tail = tx_id.replace(prefix, "")
+if tail.isdigit():
+max_num = max(max_num, int(tail))
 
-    for r in rows[1:]:
-        tx = str(r[2]).strip() if len(r) > 2 else ""
-        if tx.startswith(prefix):
-            tail = tx.replace(prefix, "")
-            if tail.isdigit():
-                num = max(num, int(tail))
-
-    return prefix + str(num + 1).zfill(4)
+return f"{prefix}{str(max_num + 1).zfill(4)}"
 
 
 def get_bank_total_balance(bank_code):
-    bank_code = str(bank_code).strip().upper()
-    opening = 0.0
+bank_code = str(bank_code).strip().upper()
 
-    for b in get_bank_rows():
-        if b["bankCode"] == bank_code:
-            opening = b["openingBalance"]
-            break
+opening_balance = 0.0
+for bank in get_bank_rows():
+if bank["bankCode"] == bank_code:
+opening_balance = float(bank.get("openingBalance", 0.0))
+break
 
-    ws = get_sheet("TRANSAKSI")
-    rows = ws.get_all_values()
+tx_ws = get_sheet("TRANSAKSI")
+rows = tx_ws.get_all_values()
 
-    balance = opening
+balance = opening_balance
 
-    for r in rows[1:]:
-        status = str(r[7]).strip() if len(r) > 7 else ""
-        if status != "Success":
-            continue
+for row in rows[1:]:
+tx_type = str(row[3]).strip().upper() if len(row) > 3 else ""
+amount = parse_amount(row[5]) if len(row) > 5 else 0.0
+row_bank_code = str(row[6]).strip().upper() if len(row) > 6 else ""
+status = str(row[7]).strip() if len(row) > 7 else ""
 
-        code = str(r[6]).strip().upper() if len(r) > 6 else ""
-        if code != bank_code:
-            continue
+if status != "Success":
+continue
+if row_bank_code != bank_code:
+continue
 
-        amt = parse_amount(r[5]) if len(r) > 5 else 0.0
-        tx_type = str(r[3]).strip().upper() if len(r) > 3 else ""
+if tx_type == "IN":
+balance += amount
+elif tx_type == "OUT":
+balance -= amount
 
-        if tx_type == "IN":
-            balance += amt
-        elif tx_type == "OUT":
-            balance -= amt
-
-    return balance
+return balance
 
 
 def parse_tx_command(text):
-    m = re.match(r"^([+-])\s*(\d+(?:[.,]\d+)?)\s+([A-Za-z0-9_]+)$", text.strip())
-    if not m:
-        return None
+m = re.match(r"^([+-])\s*(\d+(?:[.,]\d+)?)\s+([A-Za-z0-9_]+)$", text.strip())
+if not m:
+return None
 
-    return {
-        "type": "IN" if m.group(1) == "+" else "OUT",
-        "amount": parse_amount(m.group(2)),
-        "bankCode": m.group(3).upper()
-    }
+return {
+type: "IN" if m.group(1) == "+" else "OUT",
+amount: parse_amount(m.group(2)),
+bankCode: m.group(3).upper()
+}
 
 
 def parse_cancel_command(text):
-    m = re.match(r"^cancel\s+([A-Za-z0-9]+)$", text.strip(), re.IGNORECASE)
-    if not m:
-        return None
-    return m.group(1).upper()
+m = re.match(r"^(?:cancel|batal)\s+([A-Za-z0-9]+)$", text.strip(), re.IGNORECASE)
+if not m:
+return None
+return m.group(1).upper()
 
 
 def cancel_transaction(tx_id):
-    ws = get_sheet("TRANSAKSI")
-    rows = ws.get_all_values()
+tx_id = str(tx_id).strip().upper()
+ws = get_sheet("TRANSAKSI")
+rows = ws.get_all_values()
 
-    for i, r in enumerate(rows[1:], start=2):
-        row_tx_id = str(r[2]).strip().upper() if len(r) > 2 else ""
+for idx, row in enumerate(rows[1:], start=2):
+row_tx_id = str(row[2]).strip().upper() if len(row) > 2 else ""
+if row_tx_id != tx_id:
+continue
 
-        if row_tx_id == tx_id:
-            status = str(r[7]).strip() if len(r) > 7 else ""
+tx_date = str(row[0]).strip() if len(row) > 0 else ""
+tx_time = str(row[1]).strip() if len(row) > 1 else ""
+tx_type = str(row[3]).strip().upper() if len(row) > 3 else ""
+member_name = str(row[4]).strip() if len(row) > 4 else ""
+amount = parse_amount(row[5]) if len(row) > 5 else 0.0
+bank_code = str(row[6]).strip().upper() if len(row) > 6 else ""
+status = str(row[7]).strip() if len(row) > 7 else ""
 
-            if status == "Cancelled":
-                return "already"
+if status == "Cancelled":
+return {"ok": False, "reason": "already_cancelled"}
 
-            if status != "Success":
-                return "invalid"
+if status != "Success":
+return {"ok": False, "reason": f"invalid_status_{status}"}
 
-            ws.update_cell(i, 8, "Cancelled")
-            return "ok"
+ws.update_cell(idx, 8, "Cancelled")
 
-    return "notfound"
+return {
+ok: True,
+tx_id: row_tx_id,
+date: tx_date,
+time: tx_time,
+type: tx_type,
+name: member_name,
+amount: amount,
+bank_code: bank_code,
+status: "Cancelled"
+}
+
+return {"ok": False, "reason": "not_found"}
 
 
 def build_summary_text():
-    ws = get_sheet("TRANSAKSI")
-    rows = ws.get_all_values()
-    today = now_local().strftime("%Y-%m-%d")
+tx_ws = get_sheet("TRANSAKSI")
+rows = tx_ws.get_all_values()
+banks = get_bank_rows()
+today = now_local().strftime("%Y-%m-%d")
 
-    banks = get_bank_rows()
-    summary = {}
+summary = {}
+for b in banks:
+summary[b["bankCode"]] = {
+name: b["bankName"],
+today_in: 0.0,
+today_out: 0.0,
+opening_balance: float(b.get("openingBalance", 0.0)),
+total_balance: float(b.get("openingBalance", 0.0)),
+today_in_count: 0,
+today_out_count: 0
+}
 
-    total_in = 0.0
-    total_out = 0.0
-    count_in = 0
-    count_out = 0
+total_today_in = 0.0
+total_today_out = 0.0
+total_today_in_count = 0
+total_today_out_count = 0
 
-    for b in banks:
-        summary[b["bankCode"]] = {
-            "name": b["bankName"],
-            "in": 0.0,
-            "out": 0.0,
-            "in_count": 0,
-            "out_count": 0,
-            "balance": get_bank_total_balance(b["bankCode"])
-        }
+for row in rows[1:]:
+row_date = str(row[0]).strip() if len(row) > 0 else ""
+tx_type = str(row[3]).strip().upper() if len(row) > 3 else ""
+amount = parse_amount(row[5]) if len(row) > 5 else 0.0
+bank_code = str(row[6]).strip().upper() if len(row) > 6 else ""
+status = str(row[7]).strip() if len(row) > 7 else ""
 
-    for r in rows[1:]:
-        row_date = str(r[0]).strip() if len(r) > 0 else ""
-        tx_type = str(r[3]).strip().upper() if len(r) > 3 else ""
-        amount = parse_amount(r[5]) if len(r) > 5 else 0.0
-        bank_code = str(r[6]).strip().upper() if len(r) > 6 else ""
-        status = str(r[7]).strip() if len(r) > 7 else ""
+if status != "Success":
+continue
+if bank_code not in summary:
+continue
 
-        if row_date != today:
-            continue
+if tx_type == "IN":
+summary[bank_code]["total_balance"] += amount
+elif tx_type == "OUT":
+summary[bank_code]["total_balance"] -= amount
 
-        if status != "Success":
-            continue
+if row_date == today:
+if tx_type == "IN":
+summary[bank_code]["today_in"] += amount
+summary[bank_code]["today_in_count"] += 1
+total_today_in += amount
+total_today_in_count += 1
+elif tx_type == "OUT":
+summary[bank_code]["today_out"] += amount
+summary[bank_code]["today_out_count"] += 1
+total_today_out += amount
+total_today_out_count += 1
 
-        if bank_code not in summary:
-            continue
+def fmt(n):
+return f"{n:,.2f}"
 
-        if tx_type == "IN":
-            summary[bank_code]["in"] += amount
-            summary[bank_code]["in_count"] += 1
-            total_in += amount
-            count_in += 1
-        elif tx_type == "OUT":
-            summary[bank_code]["out"] += amount
-            summary[bank_code]["out_count"] += 1
-            total_out += amount
-            count_out += 1
+lines = ["📊 DAILY SUMMARY", f"📅 Date: {today}", ""]
 
-    lines = [
-        "📊 DAILY SUMMARY",
-        f"📅 {today}",
-        ""
-    ]
+for _, item in summary.items():
+lines.append(f"🏦 {item['name']}")
+lines.append(f"📥 IN ({item['today_in_count']}#): {fmt(item['today_in'])}")
+lines.append(f"📤 OUT ({item['today_out_count']}#): {fmt(item['today_out'])}")
+lines.append(f"💰 TOTAL BALANCE: {fmt(item['total_balance'])}")
+lines.append("")
 
-    for _, item in summary.items():
-        lines.append(f"🏦 {item['name']}")
-        lines.append(f"📥 IN ({item['in_count']}#): {item['in']:,.2f}")
-        lines.append(f"📤 OUT ({item['out_count']}#): {item['out']:,.2f}")
-        lines.append(f"💰 TOTAL BALANCE: {item['balance']:,.2f}")
-        lines.append("")
+lines.append("━━━━━━━━━━━━━━")
+lines.append(f"📈 TOTAL IN ({total_today_in_count}#): {fmt(total_today_in)}")
+lines.append(f"📉 TOTAL OUT ({total_today_out_count}#): {fmt(total_today_out)}")
+lines.append(f"💵 REMAINDER: {fmt(total_today_in - total_today_out)}")
 
-    lines.append("━━━━━━━━━━━━━━")
-    lines.append(f"📈 TOTAL IN ({count_in}#): {total_in:,.2f}")
-    lines.append(f"📉 TOTAL OUT ({count_out}#): {total_out:,.2f}")
-    lines.append(f"💵 REMAINDER: {(total_in - total_out):,.2f}")
-
-    return "\n".join(lines)
-
-
-def build_closing_csv():
-    ws = get_sheet("TRANSAKSI")
-    rows = ws.get_all_values()
-    today = now_local().strftime("%Y-%m-%d")
-
-    banks = {}
-    for b in get_bank_rows():
-        banks[b["bankCode"]] = {
-            "name": b["bankName"],
-            "IN": [],
-            "OUT": []
-        }
-
-    for r in rows[1:]:
-        if str(r[0]).strip() != today:
-            continue
-
-        if str(r[7]).strip() != "Success":
-            continue
-
-        code = str(r[6]).strip().upper() if len(r) > 6 else ""
-        if code not in banks:
-            continue
-
-        user = str(r[4]).strip() if len(r) > 4 else ""
-        amt = parse_amount(r[5]) if len(r) > 5 else 0.0
-        tx_type = str(r[3]).strip().upper() if len(r) > 3 else ""
-
-        if tx_type in ("IN", "OUT"):
-            banks[code][tx_type].append((user, amt))
-
-    output = StringIO()
-    writer = csv.writer(output)
-
-    for _, data in banks.items():
-        if not data["IN"] and not data["OUT"]:
-            continue
-
-        writer.writerow(["BANK", data["name"]])
-        writer.writerow(["TYPE", "USERNAME", "AMOUNT"])
-
-        for u, a in data["IN"]:
-            writer.writerow(["IN", u, f"{a:.2f}"])
-
-        for u, a in data["OUT"]:
-            writer.writerow(["OUT", u, f"{a:.2f}"])
-
-        writer.writerow([])
-
-    output.seek(0)
-    return output
+return "\n".join(lines)
 
 
-def send_auto_summary():
-    settings = get_settings()
-    auto_summary = str(settings.get("AUTO_SUMMARY", "")).strip().upper()
-    chat = str(settings.get("ALLOWED_CHAT_ID", "")).strip()
-    topic = str(settings.get("REPORT_TOPIC_ID", "")).strip()
+def send_report_summary(settings):
+report_chat_id = str(settings.get("REPORT_CHAT_ID", "")).strip()
+report_topic_id = str(settings.get("REPORT_TOPIC_ID", "")).strip()
+allowed_chat_id = str(settings.get("ALLOWED_CHAT_ID", "")).strip()
 
-    if auto_summary != "YES":
-        return
+target_chat_id = report_chat_id or allowed_chat_id
+target_thread_id = report_topic_id or None
 
-    if not chat or not topic:
-        return
+if not target_chat_id:
+return
 
-    send_message(chat, build_summary_text(), topic)
-
-
-def run_daily_closing():
-    settings = get_settings()
-    chat = str(settings.get("ALLOWED_CHAT_ID", "")).strip()
-    topic = str(settings.get("REPORT_TOPIC_ID", "")).strip()
-
-    if not chat or not topic:
-        return
-
-    send_message(chat, "📊 DAILY CLOSING\n\n" + build_summary_text(), topic)
-
-    csv_file = build_closing_csv()
-    filename = "closing_" + now_local().strftime("%Y-%m-%d") + ".csv"
-    send_document(chat, csv_file, filename, topic)
-
-
-def closing_scheduler():
-    while True:
-        try:
-            now = now_local()
-
-            if now.hour == 23 and now.minute == 59:
-                run_daily_closing()
-                time.sleep(60)
-
-        except Exception as e:
-            log_message("ERROR", "closing_scheduler_error", str(e))
-
-        time.sleep(20)
+summary_text = build_summary_text()
+send_message(target_chat_id, summary_text, target_thread_id)
 
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Bot running", 200
+return "Bot running", 200
 
 
 @app.route("/", methods=["POST"])
 def webhook():
-    try:
-        data = request.get_json(silent=True) or {}
-        message = data.get("message") or data.get("edited_message")
+try:
+data = request.get_json(silent=True) or {}
+print(f"[INFO] incoming {json.dumps(data)}", flush=True)
 
-        if not message:
-            return "ok", 200
+message = data.get("message") or data.get("edited_message")
+if not message:
+return "ok", 200
 
-        chat_id = str(message.get("chat", {}).get("id", "")).strip()
-        text = extract_message_text(message)
-        topic = message.get("message_thread_id")
+settings = get_settings()
+allowed_chat_id = str(settings.get("ALLOWED_CHAT_ID", "")).strip()
 
-        if not text:
-            return "ok", 200
+chat_id = str(message.get("chat", {}).get("id", "")).strip()
+thread_id = message.get("message_thread_id")
+text = extract_message_text(message)
 
-        if text.lower() == "where":
-            send_message(chat_id, f"CHAT_ID: {chat_id}\nTOPIC_ID: {topic}\nTEXT: {text}", topic)
-            return "ok", 200
+print(f"[INFO] text {text}", flush=True)
 
-        if text.lower() == "summary":
-            send_message(chat_id, build_summary_text(), topic)
-            return "ok", 200
+if allowed_chat_id and chat_id != allowed_chat_id:
+print(f"[WARN] unauthorized_chat {chat_id}", flush=True)
+return "ok", 200
 
-        cancel_id = parse_cancel_command(text)
-        if cancel_id:
-            result = cancel_transaction(cancel_id)
+if not text:
+return "ok", 200
 
-            if result == "ok":
-                send_message(chat_id, "❌ TX Cancelled\n" + cancel_id, topic)
-                try:
-                    send_auto_summary()
-                except Exception as e:
-                    log_message("ERROR", "auto_summary_after_cancel_failed", str(e))
-            elif result == "already":
-                send_message(chat_id, "TX already cancelled", topic)
-            elif result == "invalid":
-                send_message(chat_id, "TX status not valid for cancel", topic)
-            else:
-                send_message(chat_id, "TX not found", topic)
+if text.lower() == "where":
+reply = f"CHAT_ID: {chat_id}\nTOPIC_ID: {thread_id}\nTEXT: {text}"
+send_message(chat_id, reply, thread_id)
+return "ok", 200
 
-            return "ok", 200
+if text.lower() == "summary":
+send_message(chat_id, build_summary_text(), thread_id)
+return "ok", 200
 
-        cmd = parse_tx_command(text)
-        if not cmd:
-            return "ok", 200
+cancel_tx_id = parse_cancel_command(text)
+if cancel_tx_id:
+result = cancel_transaction(cancel_tx_id)
 
-        reply_msg = message.get("reply_to_message")
-        if not reply_msg:
-            send_message(chat_id, "Reply ke pesan member", topic)
-            return "ok", 200
+if not result["ok"]:
+if result["reason"] == "not_found":
+send_message(chat_id, f"TX_ID {cancel_tx_id} tidak ditemukan.", thread_id)
+elif result["reason"] == "already_cancelled":
+send_message(chat_id, f"TX_ID {cancel_tx_id} sudah pernah dibatalkan.", thread_id)
+else:
+send_message(chat_id, f"TX_ID {cancel_tx_id} gagal dibatalkan.", thread_id)
+return "ok", 200
 
-        name = extract_message_text(reply_msg).split("\n")[0].strip()
-        if not name:
-            send_message(chat_id, "Nama member tidak ditemukan", topic)
-            return "ok", 200
+bank = get_bank_info(result["bank_code"])
+bank_name = bank["bankName"] if bank else result["bank_code"]
+bank_balance = get_bank_total_balance(result["bank_code"])
 
-        bank = get_bank_info(cmd["bankCode"])
-        if not bank:
-            send_message(chat_id, "Bank tidak valid", topic)
-            return "ok", 200
+cancel_text = (
+f"❌ TRANSACTION CANCELLED\n\n"
+f"TX_ID: {result['tx_id']}\n"
+f"Date: {result['date']} {result['time']}\n"
+f"Type: {result['type']}\n"
+f"Name: {result['name']}\n"
+f"Amount: {result['amount']:,.2f}\n"
+f"Bank: {bank_name}\n"
+f"New Bank Balance: {bank_balance:,.2f}\n"
+f"Status: Cancelled"
+)
 
-        tx_id = generate_tx_id(cmd["type"])
+send_message(chat_id, cancel_text, thread_id)
 
-        ws = get_sheet("TRANSAKSI")
-        ws.append_row([
-            now_local().strftime("%Y-%m-%d"),
-            now_local().strftime("%H:%M:%S"),
-            tx_id,
-            cmd["type"],
-            name,
-            cmd["amount"],
-            cmd["bankCode"],
-            "Success"
-        ])
+try:
+send_report_summary(settings)
+except Exception as e:
+log_message("ERROR", "send_report_summary_cancel_failed", str(e))
 
-        balance = get_bank_total_balance(cmd["bankCode"])
+return "ok", 200
 
-        send_message(
-            chat_id,
-            f"""✅ {cmd['type']} SUCCESS
+cmd = parse_tx_command(text)
+if not cmd:
+print(f"[INFO] ignored_text {text}", flush=True)
+return "ok", 200
 
-TX_ID: {tx_id}
-Name: {name}
-Amount: {cmd['amount']:,.2f}
-Bank: {bank['bankName']}
-Bank Balance: {balance:,.2f}
-""",
-            topic
-        )
+reply_msg = message.get("reply_to_message")
+if not reply_msg:
+send_message(chat_id, "Reply ke pesan nama member dulu.", thread_id)
+return "ok", 200
 
-        try:
-            send_auto_summary()
-        except Exception as e:
-            log_message("ERROR", "auto_summary_after_tx_failed", str(e))
+raw_name = extract_message_text(reply_msg)
+full_name = raw_name.split("\n")[0].strip()
 
-        return "ok", 200
+if not full_name:
+send_message(chat_id, "Nama member tidak ditemukan di pesan reply.", thread_id)
+return "ok", 200
 
-    except Exception as e:
-        log_message("ERROR", "webhook_error", str(e))
-        return "ok", 200
+bank = get_bank_info(cmd["bankCode"])
+if not bank:
+send_message(
+chat_id,
+Bank tidak valid.\nValid:  + ", ".join(get_active_bank_codes()),
+thread_id
+)
+return "ok", 200
+
+tx_id = generate_tx_id(cmd["type"])
+now = now_local()
+
+tx_ws = get_sheet("TRANSAKSI")
+tx_ws.append_row([
+now.strftime("%Y-%m-%d"),
+now.strftime("%H:%M:%S"),
+tx_id,
+cmd["type"],
+full_name,
+cmd["amount"],
+cmd["bankCode"],
+Success
+])
+
+bank_balance = get_bank_total_balance(cmd["bankCode"])
+
+success_text = (
+f"✅ {cmd['type']} SUCCESS\n\n"
+f"TX_ID: {tx_id}\n"
+f"Name: {full_name}\n"
+f"Amount: {cmd['amount']:,.2f}\n"
+f"Bank: {bank['bankName']}\n"
+f"Bank Balance: {bank_balance:,.2f}\n"
+f"Status: Success"
+)
+
+send_message(chat_id, success_text, thread_id)
+
+try:
+send_report_summary(settings)
+except Exception as e:
+log_message("ERROR", "send_report_summary_success_failed", str(e))
+
+return "ok", 200
+
+except Exception as e:
+log_message("ERROR", "webhook_error", str(e))
+return "ok", 200
 
 
 if __name__ == "__main__":
-    scheduler = threading.Thread(target=closing_scheduler)
-    scheduler.daemon = True
-    scheduler.start()
-
-    port = int(os.environ.get("PORT", 10000))
-
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=False,
-        use_reloader=False
-    )
+port = int(os.environ.get("PORT", 10000))
+app.run(host="0.0.0.0", port=port)
