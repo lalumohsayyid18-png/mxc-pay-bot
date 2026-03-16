@@ -302,27 +302,33 @@ def get_opening_balances(spreadsheet):
 
 
 def calculate_bank_balances(spreadsheet, target_date=None):
+    """
+    BAL  = cumulative all-time balance
+    IN/OUT/TX = daily only for target_date
+    """
     target_date = target_date or today_str()
     rows = get_all_main_records(spreadsheet)
     opening_balances = get_opening_balances(spreadsheet)
 
-    summary = {}
+    daily_summary = {}
+    cumulative_summary = {}
+
     total_in = 0.0
     total_out = 0.0
     success_count = 0
     cancelled_count = 0
 
     for bank_code in opening_balances.keys():
-        summary[bank_code] = {"IN": 0.0, "OUT": 0.0, "COUNT": 0}
+        daily_summary[bank_code] = {"IN": 0.0, "OUT": 0.0, "COUNT": 0}
+        cumulative_summary[bank_code] = {"IN": 0.0, "OUT": 0.0}
 
     for row in rows:
-        row_date = str(row.get("DATE", "")).strip()
-        if row_date != target_date:
-            continue
-
         bank = normalize_bank_code(str(row.get("BANK_CODE", "")).strip()) or "UNKNOWN"
-        if bank not in summary:
-            summary[bank] = {"IN": 0.0, "OUT": 0.0, "COUNT": 0}
+
+        if bank not in daily_summary:
+            daily_summary[bank] = {"IN": 0.0, "OUT": 0.0, "COUNT": 0}
+        if bank not in cumulative_summary:
+            cumulative_summary[bank] = {"IN": 0.0, "OUT": 0.0}
 
         status = str(row.get("STATUS", "")).strip().lower()
         tx_type = str(row.get("TYPE", "")).strip().upper()
@@ -333,32 +339,49 @@ def calculate_bank_balances(spreadsheet, target_date=None):
             amount = 0.0
 
         if status == "success":
-            success_count += 1
-            summary[bank]["COUNT"] += 1
-
+            # cumulative all-time
             if tx_type == "IN":
-                summary[bank]["IN"] += amount
-                total_in += amount
+                cumulative_summary[bank]["IN"] += amount
             elif tx_type == "OUT":
-                summary[bank]["OUT"] += amount
-                total_out += amount
+                cumulative_summary[bank]["OUT"] += amount
+
+            # daily only
+            row_date = str(row.get("DATE", "")).strip()
+            if row_date == target_date:
+                success_count += 1
+                daily_summary[bank]["COUNT"] += 1
+
+                if tx_type == "IN":
+                    daily_summary[bank]["IN"] += amount
+                    total_in += amount
+                elif tx_type == "OUT":
+                    daily_summary[bank]["OUT"] += amount
+                    total_out += amount
 
         elif status == "cancelled":
-            cancelled_count += 1
+            row_date = str(row.get("DATE", "")).strip()
+            if row_date == target_date:
+                cancelled_count += 1
 
     balances = {}
-    for bank in summary.keys():
-        bank_in = float(summary[bank]["IN"])
-        bank_out = float(summary[bank]["OUT"])
-        cnt = int(summary[bank]["COUNT"])
+    all_banks = set(daily_summary.keys()) | set(cumulative_summary.keys()) | set(opening_balances.keys())
+
+    for bank in all_banks:
+        daily_in = float(daily_summary.get(bank, {}).get("IN", 0.0))
+        daily_out = float(daily_summary.get(bank, {}).get("OUT", 0.0))
+        daily_tx = int(daily_summary.get(bank, {}).get("COUNT", 0))
+
+        cumulative_in = float(cumulative_summary.get(bank, {}).get("IN", 0.0))
+        cumulative_out = float(cumulative_summary.get(bank, {}).get("OUT", 0.0))
         opening = float(opening_balances.get(bank, 0.0))
-        current_balance = opening + bank_in - bank_out
+
+        current_balance = opening + cumulative_in - cumulative_out
 
         balances[bank] = {
             "BAL": current_balance,
-            "IN": bank_in,
-            "OUT": bank_out,
-            "TX": cnt,
+            "IN": daily_in,
+            "OUT": daily_out,
+            "TX": daily_tx,
             "OPENING": opening
         }
 
