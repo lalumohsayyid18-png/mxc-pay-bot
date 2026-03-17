@@ -107,7 +107,7 @@ def log_message(level, message):
 
 def telegram_api(method, payload):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-    return requests.post(url, json=payload, timeout=30)
+    return requests.post(url, json=payload, timeout=20)
 
 
 def send_message(chat_id, text, reply_to_message_id=None):
@@ -339,13 +339,11 @@ def calculate_bank_balances(spreadsheet, target_date=None):
             amount = 0.0
 
         if status == "success":
-            # cumulative all-time
             if tx_type == "IN":
                 cumulative_summary[bank]["IN"] += amount
             elif tx_type == "OUT":
                 cumulative_summary[bank]["OUT"] += amount
 
-            # daily only
             row_date = str(row.get("DATE", "")).strip()
             if row_date == target_date:
                 success_count += 1
@@ -433,20 +431,6 @@ def get_single_bank_balance(spreadsheet, bank_code, target_date=None):
     })
 
 
-def send_auto_report(spreadsheet):
-    if not BOT_REPORT_CHAT_ID:
-        log_message("WARNING", "BOT_REPORT_CHAT_ID is empty, auto summary skipped.")
-        return
-
-    try:
-        text = build_daily_summary(spreadsheet, today_str())
-        resp = send_message(BOT_REPORT_CHAT_ID, text)
-        if resp is not None and not resp.ok:
-            log_message("ERROR", f"Auto summary send failed: {resp.text}")
-    except Exception as e:
-        log_message("ERROR", f"Failed to send auto report: {e}")
-
-
 def handle_new_reply_transaction(chat_id, message, text):
     parsed = parse_reply_transaction_input(text)
     if not parsed:
@@ -505,7 +489,6 @@ def handle_new_reply_transaction(chat_id, message, text):
         reply_to_message_id=message.get("message_id")
     )
 
-    send_auto_report(spreadsheet)
     return True
 
 
@@ -541,8 +524,6 @@ def handle_cancel(chat_id, text, reply_to_message_id=None):
         f"TX_ID   : <code>{tx_id}</code>",
         reply_to_message_id=reply_to_message_id
     )
-
-    send_auto_report(spreadsheet)
 
 
 def handle_summary(chat_id, text, reply_to_message_id=None):
@@ -634,7 +615,7 @@ def set_webhook():
         return jsonify({"ok": False, "error": "WEBHOOK_URL is not set"}), 400
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
-    resp = requests.post(url, json={"url": webhook_url}, timeout=30)
+    resp = requests.post(url, json={"url": webhook_url}, timeout=15)
     return jsonify(resp.json()), 200
 
 
