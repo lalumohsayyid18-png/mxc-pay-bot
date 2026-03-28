@@ -229,6 +229,39 @@ def get_row_dict_by_index(ws, row_index):
     return data
 
 
+def get_bank_list_map(spreadsheet):
+    try:
+        ws = spreadsheet.worksheet(BANK_LIST_SHEET_NAME)
+    except Exception:
+        return {}
+
+    rows = ws.get_all_records()
+    bank_map = {}
+
+    for row in rows:
+        bank = normalize_bank_code(str(row.get("BANK_CODE", "")).strip())
+        active = str(row.get("ACTIVE", "")).strip().upper()
+        if not bank or active != "YES":
+            continue
+
+        try:
+            opening = parse_amount(row.get("OPENING_BALANCE", 0))
+        except Exception:
+            opening = 0.0
+
+        bank_map[bank] = {
+            "BANK_NAME": str(row.get("BANK_NAME", "")).strip(),
+            "OPENING_BALANCE": opening
+        }
+
+    return bank_map
+
+
+def is_valid_bank_code(spreadsheet, bank_code):
+    bank_map = get_bank_list_map(spreadsheet)
+    return normalize_bank_code(bank_code) in bank_map
+
+
 def cancel_transaction(spreadsheet, tx_id):
     ws = get_main_sheet(spreadsheet)
     row_index = find_tx_row_by_id(ws, tx_id)
@@ -275,40 +308,15 @@ def get_all_main_records(spreadsheet):
     return cleaned
 
 
-def get_opening_balances(spreadsheet):
-    try:
-        ws = spreadsheet.worksheet(BANK_LIST_SHEET_NAME)
-    except Exception:
-        return {}
-
-    rows = ws.get_all_records()
-    balances = {}
-
-    for row in rows:
-        bank = normalize_bank_code(str(row.get("BANK_CODE", "")).strip())
-        active = str(row.get("ACTIVE", "")).strip().upper()
-
-        if not bank or active != "YES":
-            continue
-
-        try:
-            bal = parse_amount(row.get("OPENING_BALANCE", 0))
-        except Exception:
-            bal = 0.0
-
-        balances[bank] = bal
-
-    return balances
-
-
 def calculate_bank_balances(spreadsheet, target_date=None):
     """
     BAL  = cumulative all-time balance
     IN/OUT/TX = daily only for target_date
+    Only banks from BANK_LIST (ACTIVE=YES) are included.
     """
     target_date = target_date or today_str()
     rows = get_all_main_records(spreadsheet)
-    opening_balances = get_opening_balances(spreadsheet)
+    bank_map = get_bank_list_map(spreadsheet)
 
     daily_summary = {}
     cumulative_summary = {}
@@ -318,17 +326,16 @@ def calculate_bank_balances(spreadsheet, target_date=None):
     success_count = 0
     cancelled_count = 0
 
-    for bank_code in opening_balances.keys():
+    for bank_code in bank_map.keys():
         daily_summary[bank_code] = {"IN": 0.0, "OUT": 0.0, "COUNT": 0}
         cumulative_summary[bank_code] = {"IN": 0.0, "OUT": 0.0}
 
     for row in rows:
-        bank = normalize_bank_code(str(row.get("BANK_CODE", "")).strip()) or "UNKNOWN"
+        bank = normalize_bank_code(str(row.get("BANK_CODE", "")).strip())
 
-        if bank not in daily_summary:
-            daily_summary[bank] = {"IN": 0.0, "OUT": 0.0, "COUNT": 0}
-        if bank not in cumulative_summary:
-            cumulative_summary[bank] = {"IN": 0.0, "OUT": 0.0}
+        # ignore any bank code not in BANK_LIST
+        if bank not in bank_map:
+            continue
 
         status = str(row.get("STATUS", "")).strip().lower()
         tx_type = str(row.get("TYPE", "")).strip().upper()
@@ -362,16 +369,15 @@ def calculate_bank_balances(spreadsheet, target_date=None):
                 cancelled_count += 1
 
     balances = {}
-    all_banks = set(daily_summary.keys()) | set(cumulative_summary.keys()) | set(opening_balances.keys())
 
-    for bank in all_banks:
+    for bank, meta in bank_map.items():
         daily_in = float(daily_summary.get(bank, {}).get("IN", 0.0))
         daily_out = float(daily_summary.get(bank, {}).get("OUT", 0.0))
         daily_tx = int(daily_summary.get(bank, {}).get("COUNT", 0))
 
         cumulative_in = float(cumulative_summary.get(bank, {}).get("IN", 0.0))
         cumulative_out = float(cumulative_summary.get(bank, {}).get("OUT", 0.0))
-        opening = float(opening_balances.get(bank, 0.0))
+        opening = float(meta.get("OPENING_BALANCE", 0.0))
 
         current_balance = opening + cumulative_in - cumulative_out
 
@@ -380,7 +386,8 @@ def calculate_bank_balances(spreadsheet, target_date=None):
             "IN": daily_in,
             "OUT": daily_out,
             "TX": daily_tx,
-            "OPENING": opening
+            "OPENING": opening,
+            "BANK_NAME": meta.get("BANK_NAME", "")
         }
 
     meta = {
@@ -427,7 +434,8 @@ def get_single_bank_balance(spreadsheet, bank_code, target_date=None):
         "IN": 0.0,
         "OUT": 0.0,
         "TX": 0,
-        "OPENING": 0.0
+        "OPENING": 0.0,
+        "BANK_NAME": ""
     })
 
 
@@ -455,6 +463,15 @@ def handle_new_reply_transaction(chat_id, message, text):
         return True
 
     spreadsheet = get_spreadsheet()
+
+    if not is_valid_bank_code(spreadsheet, parsed["bank_code"]):
+        send_message(
+            chat_id,
+            f"❌ Invalid bank code: <b>{parsed['bank_code']}</b>\nPlease use a bank listed in BANK_LIST.",
+            reply_to_message_id=message.get("message_id")
+        )
+        return True
+
     tx_id = generate_tx_id(parsed["type"])
 
     append_main_transaction(
