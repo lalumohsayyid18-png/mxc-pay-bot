@@ -14,7 +14,6 @@ app = Flask(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "").strip()
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "").strip()
-BOT_REPORT_CHAT_ID = os.environ.get("BOT_REPORT_CHAT_ID", "").strip()
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 DEFAULT_TIMEZONE = os.environ.get("DEFAULT_TIMEZONE", "Asia/Kuala_Lumpur")
@@ -23,7 +22,10 @@ MAIN_SHEET_NAME = "TRANSAKSI"
 LOG_SHEET_NAME = "LOG"
 BANK_LIST_SHEET_NAME = "BANK_LIST"
 
-MAIN_HEADERS = ["DATE", "TIME", "TX_ID", "TYPE", "FULL_NAME", "AMOUNT", "BANK_CODE", "STATUS"]
+MAIN_HEADERS = [
+    "DATE", "TIME", "TX_ID", "TYPE", "FULL_NAME",
+    "AMOUNT", "BANK_CODE", "STATUS", "CONFIRMED_BY"
+]
 BANK_HEADERS = ["DATE", "FULL_NAME", "AMOUNT"]
 
 
@@ -49,8 +51,7 @@ def get_client():
 
 
 def get_spreadsheet():
-    client = get_client()
-    return client.open_by_key(SPREADSHEET_ID)
+    return get_client().open_by_key(SPREADSHEET_ID)
 
 
 def safe_sheet_title(name: str) -> str:
@@ -59,21 +60,21 @@ def safe_sheet_title(name: str) -> str:
     return name[:100] if name else "UNKNOWN"
 
 
+def normalize_bank_code(text):
+    return safe_sheet_title(text)
+
+
 def get_or_create_sheet(spreadsheet, title, rows=1000, cols=20):
     try:
-        ws = spreadsheet.worksheet(title)
+        return spreadsheet.worksheet(title)
     except Exception:
-        ws = spreadsheet.add_worksheet(title=title, rows=str(rows), cols=str(cols))
-    return ws
+        return spreadsheet.add_worksheet(title=title, rows=str(rows), cols=str(cols))
 
 
 def ensure_headers(ws, headers):
     current = ws.row_values(1)
     if current != headers:
-        if not current:
-            ws.append_row(headers, value_input_option="USER_ENTERED")
-        else:
-            ws.update("A1", [headers])
+        ws.update("A1", [headers])
 
 
 def get_main_sheet(spreadsheet):
@@ -90,16 +91,15 @@ def get_log_sheet(spreadsheet):
 
 
 def get_bank_sheet(spreadsheet, bank_code):
-    title = safe_sheet_title(bank_code)
-    ws = get_or_create_sheet(spreadsheet, title, rows=3000, cols=5)
+    ws = get_or_create_sheet(spreadsheet, normalize_bank_code(bank_code), rows=3000, cols=5)
     ensure_headers(ws, BANK_HEADERS)
     return ws
 
 
 def log_message(level, message):
     try:
-        spreadsheet = get_spreadsheet()
-        ws = get_log_sheet(spreadsheet)
+        ss = get_spreadsheet()
+        ws = get_log_sheet(ss)
         ws.append_row([today_str(), time_str(), level, str(message)], value_input_option="USER_ENTERED")
     except Exception:
         pass
@@ -113,20 +113,22 @@ def telegram_api(method, payload):
 def send_message(chat_id, text, reply_to_message_id=None):
     if not BOT_TOKEN or not chat_id:
         return None
+
     payload = {
         "chat_id": str(chat_id),
         "text": text,
         "parse_mode": "HTML"
     }
+
     if reply_to_message_id:
         payload["reply_to_message_id"] = reply_to_message_id
+
     return telegram_api("sendMessage", payload)
 
 
 def format_amount(value):
     try:
-        num = float(value)
-        return f"{num:,.2f}"
+        return f"{float(value):,.2f}"
     except Exception:
         return str(value)
 
@@ -153,24 +155,28 @@ def generate_tx_id(tx_type):
     return f"{prefix}{now_local().strftime('%Y%m%d%H%M%S%f')[:-3]}"
 
 
-def normalize_bank_code(text):
-    return safe_sheet_title(text)
+def get_operator_name(message):
+    user = message.get("from", {}) or {}
+    username = str(user.get("username", "")).strip()
+    first_name = str(user.get("first_name", "")).strip()
+    last_name = str(user.get("last_name", "")).strip()
+
+    if username:
+        return f"@{username}"
+
+    full = f"{first_name} {last_name}".strip()
+    return full if full else "UNKNOWN_OPERATOR"
 
 
 def parse_reply_transaction_input(text):
     text = (text or "").strip()
-    if not text:
-        return None
-
     m = re.match(r"^([+-])\s*([\d.,]+)\s+([A-Za-z0-9_\-]+)$", text, re.IGNORECASE)
     if not m:
         return None
 
     sign, amount_raw, bank_code = m.groups()
-    tx_type = "IN" if sign == "+" else "OUT"
-
     return {
-        "type": tx_type,
+        "type": "IN" if sign == "+" else "OUT",
         "amount": parse_amount(amount_raw),
         "bank_code": normalize_bank_code(bank_code)
     }
@@ -183,7 +189,40 @@ def extract_full_name_from_replied_message(message):
     return (reply.get("text") or reply.get("caption") or "").strip()
 
 
-def append_main_transaction(spreadsheet, tx_id, tx_type, full_name, amount, bank_code, status="Success"):
+def get_bank_list_map(spreadsheet):
+    try:
+        ws = spreadsheet.worksheet(BANK_LIST_SHEET_NAME)
+    except Exception:
+        return {}
+
+    rows = ws.get_all_records()
+    bank_map = {}
+
+    for row in rows:
+        bank = normalize_bank_code(str(row.get("BANK_CODE", "")).strip())
+        active = str(row.get("ACTIVE", "")).strip().upper()
+
+        if not bank or active != "YES":
+            continue
+
+        try:
+            opening = parse_amount(row.get("OPENING_BALANCE", 0))
+        except Exception:
+            opening = 0.0
+
+        bank_map[bank] = {
+            "BANK_NAME": str(row.get("BANK_NAME", "")).strip(),
+            "OPENING_BALANCE": opening
+        }
+
+    return bank_map
+
+
+def is_valid_bank_code(spreadsheet, bank_code):
+    return normalize_bank_code(bank_code) in get_bank_list_map(spreadsheet)
+
+
+def append_main_transaction(spreadsheet, tx_id, tx_type, full_name, amount, bank_code, confirmed_by, status="Success"):
     ws = get_main_sheet(spreadsheet)
     row = [
         today_str(),
@@ -193,7 +232,8 @@ def append_main_transaction(spreadsheet, tx_id, tx_type, full_name, amount, bank
         full_name,
         amount,
         bank_code,
-        status
+        status,
+        confirmed_by
     ]
     ws.append_row(row, value_input_option="USER_ENTERED")
     return row
@@ -206,10 +246,7 @@ def append_bank_transaction(spreadsheet, bank_code, full_name, amount, tx_type):
     if tx_type == "OUT":
         signed_amount = -signed_amount
 
-    ws.append_row(
-        [today_str(), full_name, signed_amount],
-        value_input_option="USER_ENTERED"
-    )
+    ws.append_row([today_str(), full_name, signed_amount], value_input_option="USER_ENTERED")
 
 
 def find_tx_row_by_id(ws, tx_id):
@@ -229,71 +266,11 @@ def get_row_dict_by_index(ws, row_index):
     return data
 
 
-def get_bank_list_map(spreadsheet):
-    try:
-        ws = spreadsheet.worksheet(BANK_LIST_SHEET_NAME)
-    except Exception:
-        return {}
-
-    rows = ws.get_all_records()
-    bank_map = {}
-
-    for row in rows:
-        bank = normalize_bank_code(str(row.get("BANK_CODE", "")).strip())
-        active = str(row.get("ACTIVE", "")).strip().upper()
-        if not bank or active != "YES":
-            continue
-
-        try:
-            opening = parse_amount(row.get("OPENING_BALANCE", 0))
-        except Exception:
-            opening = 0.0
-
-        bank_map[bank] = {
-            "BANK_NAME": str(row.get("BANK_NAME", "")).strip(),
-            "OPENING_BALANCE": opening
-        }
-
-    return bank_map
-
-
-def is_valid_bank_code(spreadsheet, bank_code):
-    bank_map = get_bank_list_map(spreadsheet)
-    return normalize_bank_code(bank_code) in bank_map
-
-
-def cancel_transaction(spreadsheet, tx_id):
-    ws = get_main_sheet(spreadsheet)
-    row_index = find_tx_row_by_id(ws, tx_id)
-    if not row_index or row_index == 1:
-        return False, "TX_ID not found."
-
-    data = get_row_dict_by_index(ws, row_index)
-    current_status = str(data.get("STATUS", "")).strip().lower()
-    if current_status == "cancelled":
-        return False, "This TX_ID has already been cancelled."
-
-    ws.update_cell(row_index, 8, "Cancelled")
-
-    try:
-        tx_type = str(data.get("TYPE", "")).strip().upper()
-        amount = parse_amount(data.get("AMOUNT", "0"))
-        bank_code = normalize_bank_code(data.get("BANK_CODE", "UNKNOWN"))
-        full_name = str(data.get("FULL_NAME", "")).strip()
-
-        reverse_type = "OUT" if tx_type == "IN" else "IN"
-        reversal_name = f"CANCEL {full_name}"
-        append_bank_transaction(spreadsheet, bank_code, reversal_name, amount, reverse_type)
-    except Exception as e:
-        log_message("ERROR", f"Failed to append bank reversal for {tx_id}: {e}")
-
-    return True, data
-
-
 def get_all_main_records(spreadsheet):
     ws = get_main_sheet(spreadsheet)
     rows = ws.get_all_records()
     cleaned = []
+
     for row in rows:
         cleaned.append({
             "DATE": str(row.get("DATE", "")).strip(),
@@ -303,17 +280,14 @@ def get_all_main_records(spreadsheet):
             "FULL_NAME": str(row.get("FULL_NAME", "")).strip(),
             "AMOUNT": row.get("AMOUNT", 0),
             "BANK_CODE": normalize_bank_code(str(row.get("BANK_CODE", "")).strip()),
-            "STATUS": str(row.get("STATUS", "")).strip()
+            "STATUS": str(row.get("STATUS", "")).strip(),
+            "CONFIRMED_BY": str(row.get("CONFIRMED_BY", "")).strip() or "UNKNOWN_OPERATOR"
         })
+
     return cleaned
 
 
 def calculate_bank_balances(spreadsheet, target_date=None):
-    """
-    BAL  = cumulative all-time balance
-    IN/OUT/TX = daily only for target_date
-    Only banks from BANK_LIST (ACTIVE=YES) are included.
-    """
     target_date = target_date or today_str()
     rows = get_all_main_records(spreadsheet)
     bank_map = get_bank_list_map(spreadsheet)
@@ -331,17 +305,15 @@ def calculate_bank_balances(spreadsheet, target_date=None):
         cumulative_summary[bank_code] = {"IN": 0.0, "OUT": 0.0}
 
     for row in rows:
-        bank = normalize_bank_code(str(row.get("BANK_CODE", "")).strip())
-
-        # ignore any bank code not in BANK_LIST
+        bank = row["BANK_CODE"]
         if bank not in bank_map:
             continue
 
-        status = str(row.get("STATUS", "")).strip().lower()
-        tx_type = str(row.get("TYPE", "")).strip().upper()
+        status = row["STATUS"].lower()
+        tx_type = row["TYPE"]
 
         try:
-            amount = parse_amount(row.get("AMOUNT", 0))
+            amount = parse_amount(row["AMOUNT"])
         except Exception:
             amount = 0.0
 
@@ -351,8 +323,7 @@ def calculate_bank_balances(spreadsheet, target_date=None):
             elif tx_type == "OUT":
                 cumulative_summary[bank]["OUT"] += amount
 
-            row_date = str(row.get("DATE", "")).strip()
-            if row_date == target_date:
+            if row["DATE"] == target_date:
                 success_count += 1
                 daily_summary[bank]["COUNT"] += 1
 
@@ -363,26 +334,22 @@ def calculate_bank_balances(spreadsheet, target_date=None):
                     daily_summary[bank]["OUT"] += amount
                     total_out += amount
 
-        elif status == "cancelled":
-            row_date = str(row.get("DATE", "")).strip()
-            if row_date == target_date:
-                cancelled_count += 1
+        elif status == "cancelled" and row["DATE"] == target_date:
+            cancelled_count += 1
 
     balances = {}
 
     for bank, meta in bank_map.items():
-        daily_in = float(daily_summary.get(bank, {}).get("IN", 0.0))
-        daily_out = float(daily_summary.get(bank, {}).get("OUT", 0.0))
-        daily_tx = int(daily_summary.get(bank, {}).get("COUNT", 0))
+        daily_in = daily_summary[bank]["IN"]
+        daily_out = daily_summary[bank]["OUT"]
+        daily_tx = daily_summary[bank]["COUNT"]
 
-        cumulative_in = float(cumulative_summary.get(bank, {}).get("IN", 0.0))
-        cumulative_out = float(cumulative_summary.get(bank, {}).get("OUT", 0.0))
+        cumulative_in = cumulative_summary[bank]["IN"]
+        cumulative_out = cumulative_summary[bank]["OUT"]
         opening = float(meta.get("OPENING_BALANCE", 0.0))
 
-        current_balance = opening + cumulative_in - cumulative_out
-
         balances[bank] = {
-            "BAL": current_balance,
+            "BAL": opening + cumulative_in - cumulative_out,
             "IN": daily_in,
             "OUT": daily_out,
             "TX": daily_tx,
@@ -426,6 +393,60 @@ def build_daily_summary(spreadsheet, target_date=None):
     return "\n".join(lines)
 
 
+def build_operator_summary(spreadsheet, target_date=None):
+    target_date = target_date or today_str()
+    rows = get_all_main_records(spreadsheet)
+
+    ops = {}
+
+    for row in rows:
+        if row["DATE"] != target_date:
+            continue
+        if row["STATUS"].lower() != "success":
+            continue
+
+        op = row["CONFIRMED_BY"] or "UNKNOWN_OPERATOR"
+        tx_type = row["TYPE"]
+
+        try:
+            amount = parse_amount(row["AMOUNT"])
+        except Exception:
+            amount = 0.0
+
+        if op not in ops:
+            ops[op] = {
+                "IN_COUNT": 0,
+                "OUT_COUNT": 0,
+                "IN_AMOUNT": 0.0,
+                "OUT_AMOUNT": 0.0
+            }
+
+        if tx_type == "IN":
+            ops[op]["IN_COUNT"] += 1
+            ops[op]["IN_AMOUNT"] += amount
+        elif tx_type == "OUT":
+            ops[op]["OUT_COUNT"] += 1
+            ops[op]["OUT_AMOUNT"] += amount
+
+    lines = [f"<b>OPERATOR SUMMARY {target_date}</b>", ""]
+
+    if not ops:
+        lines.append("No confirmed transactions.")
+        return "\n".join(lines)
+
+    for op in sorted(ops.keys()):
+        item = ops[op]
+        total_tx = item["IN_COUNT"] + item["OUT_COUNT"]
+        lines.append(
+            f"<b>{op}</b>\n"
+            f"IN: {item['IN_COUNT']} TX / {format_amount(item['IN_AMOUNT'])}\n"
+            f"OUT: {item['OUT_COUNT']} TX / {format_amount(item['OUT_AMOUNT'])}\n"
+            f"TOTAL TX: {total_tx}"
+        )
+
+    return "\n".join(lines)
+
+
 def get_single_bank_balance(spreadsheet, bank_code, target_date=None):
     bank_code = normalize_bank_code(bank_code)
     balances, _ = calculate_bank_balances(spreadsheet, target_date or today_str())
@@ -434,9 +455,36 @@ def get_single_bank_balance(spreadsheet, bank_code, target_date=None):
         "IN": 0.0,
         "OUT": 0.0,
         "TX": 0,
-        "OPENING": 0.0,
-        "BANK_NAME": ""
+        "OPENING": 0.0
     })
+
+
+def cancel_transaction(spreadsheet, tx_id):
+    ws = get_main_sheet(spreadsheet)
+    row_index = find_tx_row_by_id(ws, tx_id)
+
+    if not row_index or row_index == 1:
+        return False, "TX_ID not found."
+
+    data = get_row_dict_by_index(ws, row_index)
+
+    if str(data.get("STATUS", "")).strip().lower() == "cancelled":
+        return False, "This TX_ID has already been cancelled."
+
+    ws.update_cell(row_index, 8, "Cancelled")
+
+    try:
+        tx_type = str(data.get("TYPE", "")).strip().upper()
+        amount = parse_amount(data.get("AMOUNT", "0"))
+        bank_code = normalize_bank_code(data.get("BANK_CODE", "UNKNOWN"))
+        full_name = str(data.get("FULL_NAME", "")).strip()
+
+        reverse_type = "OUT" if tx_type == "IN" else "IN"
+        append_bank_transaction(spreadsheet, bank_code, f"CANCEL {full_name}", amount, reverse_type)
+    except Exception as e:
+        log_message("ERROR", f"Failed to append bank reversal for {tx_id}: {e}")
+
+    return True, data
 
 
 def handle_new_reply_transaction(chat_id, message, text):
@@ -444,8 +492,7 @@ def handle_new_reply_transaction(chat_id, message, text):
     if not parsed:
         return False
 
-    reply = message.get("reply_to_message")
-    if not reply:
+    if not message.get("reply_to_message"):
         send_message(
             chat_id,
             "Please reply to the member name first.\n\nExample:\n<code>Walter jay</code>\nThen reply with:\n<code>+100 TERRI</code>",
@@ -454,12 +501,10 @@ def handle_new_reply_transaction(chat_id, message, text):
         return True
 
     full_name = extract_full_name_from_replied_message(message)
+    confirmed_by = get_operator_name(message)
+
     if not full_name:
-        send_message(
-            chat_id,
-            "The replied message has no readable name.",
-            reply_to_message_id=message.get("message_id")
-        )
+        send_message(chat_id, "The replied message has no readable name.", reply_to_message_id=message.get("message_id"))
         return True
 
     spreadsheet = get_spreadsheet()
@@ -475,21 +520,22 @@ def handle_new_reply_transaction(chat_id, message, text):
     tx_id = generate_tx_id(parsed["type"])
 
     append_main_transaction(
-        spreadsheet=spreadsheet,
-        tx_id=tx_id,
-        tx_type=parsed["type"],
-        full_name=full_name,
-        amount=parsed["amount"],
-        bank_code=parsed["bank_code"],
-        status="Success"
+        spreadsheet,
+        tx_id,
+        parsed["type"],
+        full_name,
+        parsed["amount"],
+        parsed["bank_code"],
+        confirmed_by,
+        "Success"
     )
 
     append_bank_transaction(
-        spreadsheet=spreadsheet,
-        bank_code=parsed["bank_code"],
-        full_name=full_name,
-        amount=parsed["amount"],
-        tx_type=parsed["type"]
+        spreadsheet,
+        parsed["bank_code"],
+        full_name,
+        parsed["amount"],
+        parsed["type"]
     )
 
     bank_balance = get_single_bank_balance(spreadsheet, parsed["bank_code"], today_str())
@@ -497,12 +543,13 @@ def handle_new_reply_transaction(chat_id, message, text):
     send_message(
         chat_id,
         f"✅ <b>TRANSACTION SUCCESS</b>\n\n"
-        f"Member  : <b>{full_name}</b>\n"
-        f"Bank    : <b>{parsed['bank_code']}</b>\n"
-        f"Type    : <b>{parsed['type']}</b>\n"
-        f"Amount  : <b>{format_amount(parsed['amount'])}</b>\n"
-        f"Balance : <b>{format_amount(bank_balance['BAL'])}</b>\n\n"
-        f"TX_ID   : <code>{tx_id}</code>",
+        f"Member     : <b>{full_name}</b>\n"
+        f"Bank       : <b>{parsed['bank_code']}</b>\n"
+        f"Type       : <b>{parsed['type']}</b>\n"
+        f"Amount     : <b>{format_amount(parsed['amount'])}</b>\n"
+        f"Balance    : <b>{format_amount(bank_balance['BAL'])}</b>\n"
+        f"Confirmed  : <b>{confirmed_by}</b>\n\n"
+        f"TX_ID      : <code>{tx_id}</code>",
         reply_to_message_id=message.get("message_id")
     )
 
@@ -512,11 +559,7 @@ def handle_new_reply_transaction(chat_id, message, text):
 def handle_cancel(chat_id, text, reply_to_message_id=None):
     m = re.match(r"^(?:/cancel|cancel)\s+([A-Za-z0-9]+)$", text.strip(), re.IGNORECASE)
     if not m:
-        send_message(
-            chat_id,
-            "Invalid cancel format.\nExample: <code>/cancel IN20260314123000123</code>",
-            reply_to_message_id=reply_to_message_id
-        )
+        send_message(chat_id, "Invalid cancel format.\nExample: <code>/cancel IN20260314123000123</code>", reply_to_message_id=reply_to_message_id)
         return
 
     tx_id = m.group(1).strip()
@@ -550,8 +593,17 @@ def handle_summary(chat_id, text, reply_to_message_id=None):
     if m and m.group(1):
         target_date = m.group(1)
 
-    summary_text = build_daily_summary(spreadsheet, target_date)
-    send_message(chat_id, summary_text, reply_to_message_id=reply_to_message_id)
+    send_message(chat_id, build_daily_summary(spreadsheet, target_date), reply_to_message_id=reply_to_message_id)
+
+
+def handle_opsummary(chat_id, text, reply_to_message_id=None):
+    spreadsheet = get_spreadsheet()
+    m = re.match(r"^(?:/opsummary|opsummary)(?:\s+(\d{4}-\d{2}-\d{2}))?$", text.strip(), re.IGNORECASE)
+    target_date = today_str()
+    if m and m.group(1):
+        target_date = m.group(1)
+
+    send_message(chat_id, build_operator_summary(spreadsheet, target_date), reply_to_message_id=reply_to_message_id)
 
 
 def handle_help(chat_id, reply_to_message_id=None):
@@ -561,13 +613,15 @@ def handle_help(chat_id, reply_to_message_id=None):
         "<code>Walter jay</code>\n\n"
         "2. Reply to that message with:\n"
         "<code>+100 TERRI</code>\n"
-        "<code>-100 NEXA</code>\n"
-        "<code>-500.27 HWD</code>\n\n"
+        "<code>-100 NEXA</code>\n\n"
         "Cancel transaction:\n"
         "<code>/cancel TX_ID</code>\n\n"
         "Summary:\n"
         "<code>/summary</code>\n"
-        "<code>/summary 2026-03-15</code>"
+        "<code>/summary 2026-03-15</code>\n\n"
+        "Operator summary:\n"
+        "<code>/opsummary</code>\n"
+        "<code>/opsummary 2026-03-15</code>"
     )
     send_message(chat_id, text, reply_to_message_id=reply_to_message_id)
 
@@ -577,8 +631,7 @@ def process_telegram_update(update):
     if not message:
         return
 
-    chat = message.get("chat", {})
-    chat_id = chat.get("id")
+    chat_id = message.get("chat", {}).get("id")
     text = (message.get("text") or message.get("caption") or "").strip()
     message_id = message.get("message_id")
 
@@ -587,22 +640,24 @@ def process_telegram_update(update):
 
     try:
         if re.match(r"^/(start|help)$", text, re.IGNORECASE):
-            handle_help(chat_id, reply_to_message_id=message_id)
+            handle_help(chat_id, message_id)
             return
 
         if re.match(r"^(?:/summary|summary)(?:\s+\d{4}-\d{2}-\d{2})?$", text, re.IGNORECASE):
-            handle_summary(chat_id, text, reply_to_message_id=message_id)
+            handle_summary(chat_id, text, message_id)
+            return
+
+        if re.match(r"^(?:/opsummary|opsummary)(?:\s+\d{4}-\d{2}-\d{2})?$", text, re.IGNORECASE):
+            handle_opsummary(chat_id, text, message_id)
             return
 
         if re.match(r"^(?:/cancel|cancel)\s+[A-Za-z0-9]+$", text, re.IGNORECASE):
-            handle_cancel(chat_id, text, reply_to_message_id=message_id)
+            handle_cancel(chat_id, text, message_id)
             return
 
         if parse_reply_transaction_input(text):
             handle_new_reply_transaction(chat_id, message, text)
             return
-
-        return
 
     except Exception as e:
         log_message("ERROR", f"process_telegram_update error: {e}")
